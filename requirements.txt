@@ -1,0 +1,15 @@
+torch
+nltk
+torchtext
+openai
+python-dotenv
+pandas
+selenium
+bs4
+beautifulsoup4
+sklearn
+scikit-learn
+gensim
+tqdm
+numpy
+scikit-optimize

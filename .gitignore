@@ -1,0 +1,13 @@
+.idea
+.ipynb_checkpoints
+*/.ipynb_checkpoints
+.vector_cache
+*/.vector_cache
+.DS_Store
+*/.DS_Store
+__pycache__
+*/__pycache__
+topic_model/data/test*
+topic_model/data/train*
+*.pem
+topic_model/data/models/*
