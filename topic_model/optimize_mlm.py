@@ -50,10 +50,10 @@ def objective(lr, chunk_size, num_layers, batch_size, embedding_size, num_heads,
     # Read the loss from the file and return the minimum loss
     loss_df = pd.read_csv("loss.csv")
     # Ignore different runs
-    loss_df = loss_df[loss_df["run_code"] == run_code]
+    loss_df = loss_df[loss_df["run_code"] == trainer.run_code]
 
     record_run(
-        run_code, chunk_size, batch_size, epochs, embedding_size, num_heads, dim_feedforward, num_layers, lr
+        trainer.run_code, chunk_size, batch_size, epochs, embedding_size, num_heads, dim_feedforward, num_layers, lr
     )
     
     # Return the minimum loss
