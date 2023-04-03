@@ -540,7 +540,7 @@ class DocumentEmbeddingTrainer:
         adversary_logits = self.adversary(embeddings, num_topics)
         try:
             adversary_targets = torch.tensor(
-                [pseudo_labels[idx.item()] for idx in input_ids[:, 0]], dtype=torch.long, device=self.device
+                [pseudo_labels[idx] for idx in sample_indices], dtype=torch.long, device=self.device
             )
         except KeyError as ke:
             raise KeyError(f"KeyError: {ke} in {pseudo_labels.keys()}")

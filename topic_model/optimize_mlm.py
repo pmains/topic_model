@@ -7,7 +7,7 @@ from doc_embed_torch import DocumentEmbeddingTrainer, record_run
 
 # Define the search space
 space = [
-    Real(1e-6, 1e-2, name="lr", prior="log-uniform"),
+    Real(1e-6, 1e-1, name="lr", prior="log-uniform"),
     Integer(0, 2, name="chunk_size"),
     Integer(0, 3, name="num_layers"),
     Integer(0, 5, name="batch_size"),
