@@ -152,8 +152,9 @@ class DocumentMLMEmbedder(nn.Module):
         encoded = self.transformer(embedded, embedded)  # shape (batch_size, seq_len, embedding_size)
 
         if return_doc_embedding:
-            # Use the output of the last token in the sequence
-            doc_embedding = encoded[-1]  # shape (batch_size, embedding_size)
+            # Use the output of the first token as the document embedding
+            doc_embedding = encoded[:, 0, :]  # shape (batch_size, embedding_size)
+
             return doc_embedding
 
         # Output token-level predictions
@@ -451,14 +452,14 @@ class DocumentEmbeddingTrainer:
         for idx, pseudo_label in pseudo_labels.items():
             input_ids = self.train_dataset[idx]
             # Move the batch and label to the device
-            input_ids = input_ids.to(self.device)
+            input_ids = input_ids.unsqueeze(0).to(self.device)
             embedding = self.model(input_ids, return_doc_embedding=True)
-            pseudo_label = torch.tensor(pseudo_label).to(self.device).unsqueeze(0)
+            pseudo_label = torch.tensor(pseudo_label).to(self.device)
 
             # Zero out the gradients
             optimizer.zero_grad()
             # Generate the topic logits
-            logits = self.adversary(embedding.unsqueeze(0), num_topics)
+            logits = self.adversary(embedding.unsqueeze(0), num_topics).squeeze().unsqueeze(0)
             # Calculate the loss comparing the logits to the label
             loss = loss_function(logits, pseudo_label)
             # Back-propagate the loss
@@ -477,7 +478,7 @@ class DocumentEmbeddingTrainer:
         # Return the average loss
         return total_loss / num_batches
 
-    def train_combined(self, alpha):
+    def train_combined(self, epoch_size=8):
         """Reinforcement learning to train the DocumentMLMEmbedder model"""
 
         # Set both the model and the adversary to training mode
@@ -485,7 +486,7 @@ class DocumentEmbeddingTrainer:
         self.adversary.train()
 
         # Create the optimizer and loss function
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.mlm_lr)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.adversary_lr)
         # Ignore the loss for outliers and masked tokens
         loss_function = torch.nn.CrossEntropyLoss(ignore_index=-1)
 
@@ -497,67 +498,35 @@ class DocumentEmbeddingTrainer:
         # Get token_ids for the sample_indices of this indices as a tensor
         # Convert the list of token id tensors to a tensor of token id tensors
         input_ids = torch.stack([self.train_dataset[idx] for idx in sample_indices])
+        input_ids = input_ids.to(self.device)
 
-        # Get masked input ids and labels for each document in the batch and concatenate them in tensors
-        masked_input_ids = None
-        batch_labels = None
-        for idx, doc_token_ids in enumerate(input_ids):
-            # Apply masking to the token ids
-            doc_masked_input_ids, doc_labels = self.masked_dataset.mask_tokens(doc_token_ids)
-            # Convert the labels to tensors
-            doc_labels = torch.tensor(doc_labels).to(self.device)
-
-            # If this is the first document, create the masked_input_ids and batch_labels tensors
-            if masked_input_ids is None:
-                masked_input_ids = doc_masked_input_ids.unsqueeze(0)
-                batch_labels = doc_labels.unsqueeze(0)
-            # Otherwise, concatenate the masked_input_ids and batch_labels tensors
-            else:
-                masked_input_ids = torch.concat([masked_input_ids, doc_masked_input_ids.unsqueeze(0)])
-                batch_labels = torch.concat([batch_labels, doc_labels.unsqueeze(0)])
-
-        # Move the masked inputs and labels to the device
-        masked_input_ids = masked_input_ids.to(self.device)
-        # Make sure the labels are a tensor
-        if not isinstance(batch_labels, torch.Tensor):
-            batch_labels = torch.tensor(batch_labels).to(self.device)
-
-        embeddings = self.model(masked_input_ids, return_doc_embedding=True)
-
-        # Compute the MLM loss
-        mlm_loss = self.calc_mlm_loss(masked_input_ids, batch_labels, loss_function)
-
-        # Generate the document embeddings and pseudo-labels
+        # Get embeddings for the input_ids
+        embeddings = self.model(input_ids, return_doc_embedding=True)
+        # Generate the pseudo-labels
         pseudo_labels = self.generate_pseudo_labels(embeddings=embeddings, sample_indices=sample_indices)
         # Get the number of topics from the pseudo-labels
         topic_set = set(pseudo_labels.values())
         num_topics = len(topic_set) - 1 if -1 in topic_set else len(topic_set)
 
-        # Compute the document embedding adversary loss
+        # Skip the batch if there are no topics
         if num_topics == 0:
             return None
 
         adversary_logits = self.adversary(embeddings, num_topics)
-        try:
-            adversary_targets = torch.tensor(
-                [pseudo_labels[idx] for idx in sample_indices], dtype=torch.long, device=self.device
-            )
-        except KeyError as ke:
-            raise KeyError(f"KeyError: {ke} in {pseudo_labels.keys()}")
+        adversary_targets = torch.tensor(
+            [pseudo_labels[idx] for idx in sample_indices], dtype=torch.long, device=self.device
+        )
         adversary_loss = loss_function(adversary_logits, adversary_targets)
 
-        # Compute the combined loss
-        combined_loss = mlm_loss + alpha * adversary_loss
-
         # Back-propagate the combined loss
-        combined_loss.backward()
+        adversary_loss.backward()
 
         # Update the model parameters
         optimizer.step()
 
         # Update the total loss and number of batches
-        print(f"MLM loss: {mlm_loss.item()} Adversary loss: {adversary_loss.item()} Combined: {combined_loss.item()}")
-        return combined_loss.item()
+        print(f"Adversary loss: {adversary_loss.item()}")
+        return adversary_loss.item()
 
     def generate_pseudo_labels(self, sample_size=64, embeddings=None, sample_indices=None):
         """
@@ -595,8 +564,8 @@ class DocumentEmbeddingTrainer:
                 for idx in tqdm(sample_indices):
                     batch = self.train_dataset[idx]
                     # Generate document embeddings for the documents in the batch
-                    doc_embedding = self.model(batch.to(self.device), return_doc_embedding=True)
-                    embeddings = torch.cat([embeddings, doc_embedding.unsqueeze(0)])
+                    doc_embedding = self.model(batch.unsqueeze(0).to(self.device), return_doc_embedding=True)
+                    embeddings = torch.cat([embeddings, doc_embedding])
 
         # Use DBScan to cluster the document embeddings
         # This will generate a list of cluster labels for each document
@@ -689,7 +658,7 @@ class DocumentEmbeddingTrainer:
             # 4. Update the DocumentMLMEmbedder using a combined loss that includes the original loss and an
             # adversarial loss based on the DocumentEmbeddingAdversary's predictions.
             print("Updating the DocumentMLMEmbedder model ...")
-            combined_loss = self.train_combined(alpha=0.5)
+            combined_loss = self.train_combined()
             if combined_loss is None:
                 print("Combined loss is None. Skipping this epoch.")
                 continue
