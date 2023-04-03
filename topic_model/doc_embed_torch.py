@@ -33,10 +33,28 @@ EMBED_VOCAB = vocab.GloVe(name='6B', dim=100)
 
 
 # Add the [MASK] token to the vocabulary if it doesn't exist
-def add_token_to_vocab(token):
+def add_token_to_vocab(token, embedding_size=100):
     if token not in EMBED_VOCAB.stoi:
         EMBED_VOCAB.itos.append(token)
-        EMBED_VOCAB.stoi[token] = len(EMBED_VOCAB)
+        EMBED_VOCAB.stoi[token] = len(EMBED_VOCAB.itos)-1
+
+        # Make sure data/vocab exists
+        if not os.path.exists(os.path.join("data", "vocab")):
+            os.mkdir(os.path.join("data", "vocab"))
+
+        # Check if the vector for the token already exists
+        vector_path = os.path.join("data", "vocab", f"{token}.pt")
+        if os.path.exists(vector_path):
+            # Load the vector from a file
+            with open(vector_path, "rb") as f:
+                new_vector = torch.load(f)
+        else:
+            new_vector = torch.randn(embedding_size)
+            # Save the new vector to a file
+            with open(os.path.join("data", "vocab", f"{token}.pt"), "wb") as f:
+                torch.save(new_vector, f)
+
+        EMBED_VOCAB.vectors = torch.cat([EMBED_VOCAB.vectors, new_vector.unsqueeze(0)])
         return EMBED_VOCAB.stoi[token]
 
     return EMBED_VOCAB.stoi[token]
@@ -360,7 +378,7 @@ class DocumentEmbeddingTrainer:
                 target_ids_tensor = torch.tensor(masked_target_ids).unsqueeze(0).to(self.device)
 
                 # Forward pass through the model
-                logits = self.model(masked_token_ids_tensor)
+                logits = self.model(masked_token_ids_tensor.unsqueeze(0).to(self.device))
 
                 # Calculate the loss
                 loss = loss_function(logits.squeeze(0), target_ids_tensor.squeeze(0))
@@ -497,7 +515,8 @@ class DocumentEmbeddingTrainer:
         # Move the masked inputs and labels to the device
         masked_input_ids = masked_input_ids.to(self.device)
         # Make sure the labels are a tensor
-        batch_labels = torch.tensor(batch_labels).to(self.device)
+        if not isinstance(batch_labels, torch.Tensor):
+            batch_labels = torch.tensor(batch_labels).to(self.device)
 
         embeddings = self.model(masked_input_ids, return_doc_embedding=True)
 
@@ -515,9 +534,12 @@ class DocumentEmbeddingTrainer:
             return None
 
         adversary_logits = self.adversary(embeddings, num_topics)
-        adversary_targets = torch.tensor(
-            [pseudo_labels[idx.item()] for idx in input_ids[:, 0]], dtype=torch.long, device=self.device
-        )
+        try:
+            adversary_targets = torch.tensor(
+                [pseudo_labels[idx.item()] for idx in input_ids[:, 0]], dtype=torch.long, device=self.device
+            )
+        except KeyError as ke:
+            raise KeyError(f"KeyError: {ke} in {pseudo_labels.keys()}")
         adversary_loss = loss_function(adversary_logits, adversary_targets)
 
         # Compute the combined loss
@@ -575,7 +597,7 @@ class DocumentEmbeddingTrainer:
         # Use DBScan to cluster the document embeddings
         # This will generate a list of cluster labels for each document
         # The label -1 indicates that the document is an outlier
-        db = DBSCAN(eps=0.8, min_samples=3)
+        db = DBSCAN(eps=20, min_samples=3)
         # Fit the DBScan model to the document embeddings
         print("Clustering document embeddings...")
         db.fit(embeddings.detach().numpy())
@@ -809,9 +831,8 @@ if __name__ == "__main__":
     trainer = None
     if pargs.train:
         print("Training model...")
-        my_run_code = gen_run_code()
         trainer = DocumentEmbeddingTrainer(
-            run_code=my_run_code, chunk_size=pargs.chunk_size, embedding_size=pargs.embedding_size
+            chunk_size=pargs.chunk_size, embedding_size=pargs.embedding_size
         )
         trainer.init_mlm(
             batch_size=pargs.batch_size, num_epochs=pargs.epochs, num_heads=pargs.num_heads,
@@ -820,7 +841,7 @@ if __name__ == "__main__":
         trainer.train()
 
         record_run(
-            my_run_code, pargs.chunk_size, pargs.batch_size, pargs.epochs, pargs.embedding_size, pargs.num_heads,
+            trainer.run_code, pargs.chunk_size, pargs.batch_size, pargs.epochs, pargs.embedding_size, pargs.num_heads,
             pargs.dim_feedforward, pargs.num_layers, pargs.lr
         )
 
