@@ -404,6 +404,10 @@ class DocumentEmbeddingTrainer:
             loss_df = new_loss_df
         loss_df.to_csv("loss.csv", index=False)
 
+        # Make sure the models directory exists
+        if not os.path.exists(os.path.join("data", "models")):
+            os.mkdir(os.path.join("data", "models"))
+
         # Save the model
         torch.save(
             self.model.state_dict(),
