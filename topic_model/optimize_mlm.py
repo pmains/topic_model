@@ -38,6 +38,11 @@ def objective(lr, chunk_size, num_layers, batch_size, embedding_size, num_heads,
         num_layers=num_layers,
         lr=lr
     )
+    print(
+        f"Training {trainer.run_code} with lr={lr}, chunk_size={chunk_size}, num_layers={num_layers}, "
+        f"batch_size={batch_size}, embedding_size={embedding_size}, num_heads={num_heads},"
+        f"dim_feedforward={dim_feedforward} for {epochs} epochs"
+    )
 
     # Train the model
     trainer.train()
