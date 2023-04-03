@@ -574,10 +574,12 @@ class DocumentEmbeddingTrainer:
         if self.eps is None:
             # Get the distance matrix for the document embeddings, using Euclidean distance
             print("Calculating distance matrix...")
+            self.eps = self.calculate_eps(embeddings)
+            print("EPS: ", self.eps)
             distance_matrix = euclidean_distances(embeddings.detach().numpy())
             # Set EPS to the 20% percentile of the distance matrix
-            self.eps = np.percentile(distance_matrix, 20)
-            print("EPS: ", self.eps)
+            np_eps = np.percentile(distance_matrix, 20)
+            print("NP EPS: ", np_eps)
 
         # Use DBScan to cluster the document embeddings
         # This will generate a list of cluster labels for each document
@@ -679,6 +681,28 @@ class DocumentEmbeddingTrainer:
 
             epoch += 1
             print(f"Combined loss: {combined_loss}")
+
+    @staticmethod
+    def calculate_eps(embeddings):
+        """Calculate the epsilon value for DBScan clustering"""
+
+        # Calculate the distance matrix for the document embeddings
+        distances = dict()
+        # Iterate over all document pairs
+        for idx, embed_i in tqdm(enumerate(embeddings)):
+            for jdx, embed_j in enumerate(embeddings):
+                # Skip if the pair has already been calculated or if the pair is the same document
+                if (idx, jdx) in distances or (jdx, idx) in distances or idx == jdx:
+                    continue
+
+                # p determines the Minkowski order. 2 is Euclidean, 1 is Manhattan. etc.
+                distances[(idx, jdx)] = torch.cdist(
+                    embed_i.unsqueeze(0), embed_j.unsqueeze(0), p=2
+                ).item()
+
+        # Get the 20th percentile of the distances, should be conducive for 5-10 topics
+        distances = list(distances.values())
+        return np.percentile(distances, 20)
 
 
 def convert_to_quantized(model):
