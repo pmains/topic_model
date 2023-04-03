@@ -718,7 +718,7 @@ def chunk_data(chunk_size):
         doc_embeddings = [EMBED_VOCAB.stoi[token] for token in word_tokenize(doc) if token in EMBED_VOCAB.stoi]
 
         # Chunk the document into CHUNK_SIZE-1 token chunks
-        for i in range(0, len(doc_embeddings), chunk_size-1):
+        for i in range(0, len(doc_embeddings), chunk_size):
             # Generate random number to determine if this chunk is in the train or test set
             if random() < 0.8:
                 chunk_dir = train_dir
@@ -726,7 +726,7 @@ def chunk_data(chunk_size):
                 chunk_dir = test_dir
 
             # Convert tokens to embeddings
-            embeddings = torch.tensor([CLS_TOKEN_ID] + [embedding for embedding in doc_embeddings[i:i+chunk_size-1]])
+            embeddings = torch.tensor([embedding for embedding in doc_embeddings[i:i+chunk_size]])
             # Pad the chunk with PAD_TOKEN_ID if it is smaller than CHUNK_SIZE
             embeddings = torch.nn.functional.pad(
                 embeddings, (0, chunk_size - len(embeddings)), "constant", PAD_TOKEN_ID
