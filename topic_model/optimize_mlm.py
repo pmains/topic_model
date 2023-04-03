@@ -3,7 +3,7 @@ import numpy as np
 from skopt import gp_minimize
 from skopt.space import Real, Integer
 from skopt.utils import use_named_args
-from doc_embed_torch import DocumentEmbeddingTrainer, gen_run_code, record_run
+from doc_embed_torch import DocumentEmbeddingTrainer, record_run
 
 # Define the search space
 space = [
@@ -28,8 +28,7 @@ def objective(lr, chunk_size, num_layers, batch_size, embedding_size, num_heads,
     batch_size = [1, 2, 4, 8, 16, 32][batch_size]  # batch_size is 1, 2, 4, 8, 16 or 32
 
     # Create a new instance of the trainer with the specified hyper-parameters
-    run_code = gen_run_code()
-    trainer = DocumentEmbeddingTrainer(chunk_size=chunk_size, embedding_size=embedding_size, run_code=run_code)
+    trainer = DocumentEmbeddingTrainer(chunk_size=chunk_size, embedding_size=embedding_size)
     epochs = 100
     trainer.init_mlm(
         batch_size=batch_size,
