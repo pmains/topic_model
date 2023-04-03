@@ -12,11 +12,14 @@ import os
 import string
 from random import random, shuffle, choice, sample
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from nltk.tokenize import word_tokenize
 from sklearn.cluster import DBSCAN
+from sklearn.metrics import euclidean_distances
+from torch import cosine_similarity
 from torch.utils.data import Dataset, DataLoader
 from torchtext import vocab
 from tqdm import tqdm
@@ -152,9 +155,8 @@ class DocumentMLMEmbedder(nn.Module):
         encoded = self.transformer(embedded, embedded)  # shape (batch_size, seq_len, embedding_size)
 
         if return_doc_embedding:
-            # Use the output of the first token as the document embedding
-            doc_embedding = encoded[:, 0, :]  # shape (batch_size, embedding_size)
-
+            # Take the mean of the encoded sequence to get a document-level embedding
+            doc_embedding = torch.mean(encoded, dim=1)  # shape (batch_size, embedding_size)
             return doc_embedding
 
         # Output token-level predictions
@@ -248,6 +250,7 @@ class DocumentEmbeddingTrainer:
 
         self.model = None
         self.adversary = None
+        self.eps = None
 
         # Hyper-parameters
         self.mlm_lr = None
@@ -567,10 +570,19 @@ class DocumentEmbeddingTrainer:
                     doc_embedding = self.model(batch.unsqueeze(0).to(self.device), return_doc_embedding=True)
                     embeddings = torch.cat([embeddings, doc_embedding])
 
+        # If the epsilon value is not set, calculate it
+        if self.eps is None:
+            # Get the distance matrix for the document embeddings, using Euclidean distance
+            print("Calculating distance matrix...")
+            distance_matrix = euclidean_distances(embeddings.detach().numpy())
+            # Set EPS to the 20% percentile of the distance matrix
+            self.eps = np.percentile(distance_matrix, 20)
+            print("EPS: ", self.eps)
+
         # Use DBScan to cluster the document embeddings
         # This will generate a list of cluster labels for each document
         # The label -1 indicates that the document is an outlier
-        db = DBSCAN(eps=20, min_samples=3)
+        db = DBSCAN(eps=self.eps, min_samples=3)
         # Fit the DBScan model to the document embeddings
         print("Clustering document embeddings...")
         db.fit(embeddings.detach().numpy())
