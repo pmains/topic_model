@@ -683,7 +683,7 @@ class DocumentEmbeddingTrainer:
             print(f"Combined loss: {combined_loss}")
 
     @staticmethod
-    def calculate_eps(embeddings):
+    def calculate_eps(embeddings, percent=20):
         """Calculate the epsilon value for DBScan clustering"""
 
         # Calculate the distance matrix for the document embeddings
@@ -702,7 +702,7 @@ class DocumentEmbeddingTrainer:
 
         # Get the 20th percentile of the distances, should be conducive for 5-10 topics
         distances = list(distances.values())
-        return np.percentile(distances, 20)
+        return np.percentile(distances, percent)
 
 
 def convert_to_quantized(model):
