@@ -19,7 +19,6 @@ import torch.nn as nn
 from nltk.tokenize import word_tokenize
 from sklearn.cluster import DBSCAN
 from sklearn.metrics import euclidean_distances
-from torch import cosine_similarity
 from torch.utils.data import Dataset, DataLoader
 from torchtext import vocab
 from tqdm import tqdm
@@ -126,7 +125,7 @@ class MaskedTextDataset(Dataset):
 
 
 class DocumentMLMEmbedder(nn.Module):
-    """This model takes a document as input and outputs token-level predictions."""
+    """Embeds documents using a masked language model for training"""
 
     def __init__(self, vocab_size, embedding_size, num_heads, dim_feedforward, num_layers):
         super(DocumentMLMEmbedder, self).__init__()
@@ -142,26 +141,28 @@ class DocumentMLMEmbedder(nn.Module):
             dropout=0.2,
         )
         self.fc = nn.Linear(embedding_size, vocab_size)
+        self.idf_weights = None
 
     def forward(self, x, return_doc_embedding=False):
-        """
-        Predict token-level embeddings from a document
-        x is of shape (batch_size, seq_len)
-        """
-
-        # Embed the input sequence
-        embedded = self.embedding(x)  # shape (batch_size, seq_len, embedding_size)
-        # Encode the input sequence using the transformer's encoder and decoder
-        encoded = self.transformer(embedded, embedded)  # shape (batch_size, seq_len, embedding_size)
+        embedded = self.embedding(x)
+        encoded = self.transformer(embedded, embedded)
 
         if return_doc_embedding:
-            # Take the mean of the encoded sequence to get a document-level embedding
-            doc_embedding = torch.mean(encoded, dim=1)  # shape (batch_size, embedding_size)
+            if self.idf_weights is None:
+                self.idf_weights = np.load(os.path.join("data", "idf_vector.npy"))
+
+            # Create a tensor with the same shape as encoded and fill it with the corresponding IDF values
+            idf_list = [self.idf_weights[token_id] for token_id in x]
+            idf_tensor = torch.tensor(idf_list).unsqueeze(1).repeat(1, encoded.shape[1])
+            # Multiply encoded by the IDF tensor
+            idf_weighted_encoded = encoded * idf_tensor
+            # Take the mean of the IDF-weighted encoded sequence to get a document-level embedding
+            doc_embedding = torch.mean(idf_weighted_encoded, dim=1)
+
             return doc_embedding
 
-        # Output token-level predictions
-        logits = self.fc(encoded)  # shape (batch_size, seq_len, vocab_size)
-
+        # Predict the masked tokens
+        logits = self.fc(encoded)
         return logits
 
 
@@ -733,9 +734,9 @@ def chunk_data(chunk_size):
         os.remove(os.path.join(test_dir, filename))
 
     # Iterate over each document, with tqdm to show progress
-    for filename in tqdm(os.listdir("data/youtube/raw")):
+    for filename in tqdm(os.listdir(os.path.join("data", "youtube", "raw"))):
         # Load the document
-        with open(f"data/youtube/raw/{filename}", "r") as f:
+        with open(os.path.join("data", "youtube", "raw", filename), "r") as f:
             doc = f.read()
 
         # Tokenize the document, and get the integer token ids
