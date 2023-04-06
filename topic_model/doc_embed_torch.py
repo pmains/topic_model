@@ -134,7 +134,7 @@ class DocumentMLMEmbedder(nn.Module):
         self.transformer = nn.Transformer(
             d_model=embedding_size,
             nhead=num_heads,
-            activation='relu',
+            activation='gelu',
             num_encoder_layers=num_layers,
             num_decoder_layers=num_layers,
             dim_feedforward=dim_feedforward,
@@ -148,16 +148,26 @@ class DocumentMLMEmbedder(nn.Module):
         encoded = self.transformer(embedded, embedded)
 
         if return_doc_embedding:
+            # Load the IDF weights if they haven't been loaded yet
             if self.idf_weights is None:
                 self.idf_weights = np.load(os.path.join("data", "idf_vector.npy"))
 
             # Create a tensor with the same shape as encoded and fill it with the corresponding IDF values
+            no_idf_tokens = {PAD_TOKEN_ID, MASK_TOKEN_ID, CLS_TOKEN_ID}
+            no_idf_mask = [token_id not in no_idf_tokens for token_id in x]
+            # Create a tensor with the same shape as encoded and fill it with the corresponding IDF values
             idf_list = [self.idf_weights[token_id] for token_id in x]
-            idf_tensor = torch.tensor(idf_list).unsqueeze(1).repeat(1, encoded.shape[1])
+            idf_tensor = torch.tensor(idf_list).unsqueeze(1).repeat(1, encoded.shape[1])[no_idf_mask]
+            # Normalize the IDF tensor
+            idf_tensor = idf_tensor / torch.sum(idf_tensor).item()
             # Multiply encoded by the IDF tensor
-            idf_weighted_encoded = encoded * idf_tensor
+            idf_weighted_encoded = encoded[no_idf_mask] * idf_tensor
+            
             # Take the mean of the IDF-weighted encoded sequence to get a document-level embedding
-            doc_embedding = torch.mean(idf_weighted_encoded, dim=1)
+            mean_embedding = torch.mean(idf_weighted_encoded, dim=1)
+            max_embedding = torch.max(encoded[no_idf_mask], dim=1)[0]
+            min_embedding = torch.min(encoded[no_idf_mask], dim=1)[0]
+            doc_embedding = torch.cat([mean_embedding, max_embedding, min_embedding])
 
             return doc_embedding
 
