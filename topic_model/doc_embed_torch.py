@@ -162,12 +162,13 @@ class DocumentMLMEmbedder(nn.Module):
             idf_tensor = idf_tensor / torch.sum(idf_tensor).item()
             # Multiply encoded by the IDF tensor
             idf_weighted_encoded = encoded[no_idf_mask] * idf_tensor
-            
+
             # Take the mean of the IDF-weighted encoded sequence to get a document-level embedding
             mean_embedding = torch.mean(idf_weighted_encoded, dim=1)
             max_embedding = torch.max(encoded[no_idf_mask], dim=1)[0]
             min_embedding = torch.min(encoded[no_idf_mask], dim=1)[0]
-            doc_embedding = torch.cat([mean_embedding, max_embedding, min_embedding])
+            std_embedding = torch.std(encoded[no_idf_mask], dim=1)
+            doc_embedding = torch.cat([mean_embedding, max_embedding, min_embedding, std_embedding])
 
             return doc_embedding
 
