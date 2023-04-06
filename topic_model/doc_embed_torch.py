@@ -312,29 +312,39 @@ class DocumentEmbeddingTrainer:
         # Ignore the loss for masked tokens
         loss_function = torch.nn.CrossEntropyLoss(ignore_index=-1)
 
+        # Sample a random subset of the dataset
+        sample_size = self.mlm_batch_size * epoch_size
+        sample_idxs = sample(range(len(self.masked_dataset)), sample_size)
+
         for i in range(epoch_size):
-            for masked_batch in self.masked_dataloader:
-                input_ids, labels = masked_batch
-                input_ids = input_ids.to(self.device)
-                labels = labels.to(self.device)
+            # Create batch of masked documents, of size self.mlm_batch_size
+            batch_idxs = sample_idxs[i * self.mlm_batch_size: (i + 1) * self.mlm_batch_size]
+            masked_batch = None
+            target_batch = None
 
-                # Clear the gradients before each forward pass
-                optimizer.zero_grad()
-                # Forward pass to get the logits
-                loss = self.calc_mlm_loss(input_ids, labels, loss_function)
-                # Calculate the gradients of the loss with respect to all the parameters
-                loss.backward()
-                # Make a step in the optimizer to update the parameters
-                optimizer.step()
+            for idx in batch_idxs:
+                masked_tokens, target_tokens = self.masked_dataset[idx]
+                if masked_batch is None:
+                    masked_batch = masked_tokens.unsqueeze(0)
+                    target_batch = target_tokens.unsqueeze(0)
+                else:
+                    masked_batch = torch.concat([masked_batch, masked_tokens.unsqueeze(0)])
+                    target_batch = torch.concat([target_batch, target_tokens.unsqueeze(0)])
 
-                total_loss += loss.item()
-                num_batches += 1
+            masked_batch = masked_batch.to(self.device)
+            target_batch = target_batch.to(self.device)
 
-                if num_batches >= len(self.masked_dataloader):
-                    break
+            # Clear the gradients before each forward pass
+            optimizer.zero_grad()
+            # Forward pass to get the logits
+            loss = self.calc_mlm_loss(masked_batch, target_batch, loss_function)
+            # Calculate the gradients of the loss with respect to all the parameters
+            loss.backward()
+            # Make a step in the optimizer to update the parameters
+            optimizer.step()
 
-            if num_batches >= len(self.masked_dataloader):
-                break
+            total_loss += loss.item()
+            num_batches += 1
 
         return total_loss / num_batches
 
