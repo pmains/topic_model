@@ -7,13 +7,13 @@ from doc_embed_torch import DocumentEmbeddingTrainer, record_run
 
 # Define the search space
 space = [
-    Real(1e-6, 1e-1, name="lr", prior="log-uniform"),
+    Real(1e-4, 1e-1, name="lr", prior="log-uniform"),
     Integer(0, 2, name="chunk_size"),
     Integer(0, 3, name="num_layers"),
-    Integer(0, 5, name="batch_size"),
-    Integer(0, 4, name="embedding_size"),
+    Integer(0, 6, name="batch_size"),
+    Integer(0, 2, name="embedding_size"),
     Integer(0, 3, name="num_heads"),
-    Integer(0, 4, name="dim_feedforward"),
+    Integer(0, 3, name="dim_feedforward"),
 ]
 
 
@@ -21,16 +21,16 @@ space = [
 @use_named_args(space)
 def objective(lr, chunk_size, num_layers, batch_size, embedding_size, num_heads, dim_feedforward):
     chunk_size = [64, 128, 256][chunk_size]  # chunk_size is 64, 128 or 256
-    dim_feedforward = [64, 128, 256, 512, 1024][dim_feedforward]  # dim_feedforward is 64, 128, 256, 512 or 1024
-    embedding_size = [64, 128, 256, 512, 1024][embedding_size]  # embedding_size is 64, 128, 256, 512 or 1024
+    dim_feedforward = [64, 128, 256, 512][dim_feedforward]  # dim_feedforward is 64, 128, 256, 512 or 1024
+    embedding_size = [64, 128, 256][embedding_size]  # embedding_size is 64, 128, 256, 512 or 1024
     num_heads = [1, 2, 4, 8][num_heads]  # num_heads is 1, 2, 4 or 8
     num_layers = [1, 2, 4, 6][num_layers]  # num_layers is 1, 2, 4 or 6
-    batch_size = [1, 2, 4, 8, 16, 32][batch_size]  # batch_size is 1, 2, 4, 8, 16 or 32
+    batch_size = [1, 2, 4, 8, 16, 32, 64][batch_size]  # batch_size is 1, 2, 4, 8, 16, 32 or 64
 
     # Create a new instance of the trainer with the specified hyper-parameters
     trainer = DocumentEmbeddingTrainer(chunk_size=chunk_size, embedding_size=embedding_size)
     epochs = 100
-    trainer.init_mlm(
+    trainer.init_model(
         batch_size=batch_size,
         num_epochs=epochs,
         num_heads=num_heads,

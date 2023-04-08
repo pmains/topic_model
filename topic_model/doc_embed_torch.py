@@ -1,10 +1,15 @@
 """
 Usage:
-    Break our documents into chunks of 1024 words each, and save them as PyTorch tensors:
-    python doc_embed_torch.py --chunk
+    Break our documents into chunks, and save them as PyTorch tensors:
+    python doc_embed_torch.py --chunk --chunk_size [chunk_size]
 
     Train the model:
-    python doc_embed_torch.py --train
+    python doc_embed_torch.py --train [--args]
+
+    Reinforce the model:
+    python doc_embed_torch.py --reinforce [--args]
+
+    --help for more info
 """
 
 import argparse
@@ -17,9 +22,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from nltk.tokenize import word_tokenize
-from sklearn.cluster import DBSCAN
-from sklearn.metrics import euclidean_distances
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from torchtext import vocab
 from tqdm import tqdm
 
@@ -96,39 +99,86 @@ class DocumentDataset(Dataset):
         return token_ids
 
 
-class MaskedTextDataset(Dataset):
-    def __init__(self, dataset, mask_prob=0.15):
-        self.dataset = dataset  # Original dataset containing token ids
-        self.mask_prob = mask_prob  # Probability of masking a token
+class PredictChunkDataset(Dataset):
+    def __init__(self, dir_path, mask_prob=0.15):
+        """
+        Files in our directory will have a name in format "{channel}-{video_id}_{chunk_id}.pt"
+        The chunk_id values are sequential, so we can use them to sort the files
+        Files are only considered sequential if they belong to the same channel and video_id
+        So we first group the files by channel and video_id, and then sort them by chunk_id
+        Only a chunk with a subsequent chunk_id can be used to predict the next chunk
+
+        :param dir_path: Path to the directory containing the dataset
+        """
+
+        self.dir_path = dir_path  # Path to the directory containing the dataset
+        self.chunk_list = []
+        self.mask_prob = mask_prob
+
+        def get_video(file_name):
+            last_underscore = file_name.rfind('_')
+            file_video_id = file_name[:last_underscore]
+            chunk_id = int(file_name[last_underscore + 1:-3])
+
+            return file_video_id, chunk_id
+
+        # Get a list of all files in the directory and create a dataframe
+        print("Grouping files by channel and video_id ...")
+        file_list = os.listdir(self.dir_path)
+        file_df = pd.DataFrame(file_list, columns=['file_name'])
+        file_df[['video_id', 'chunk_id']] = file_df.file_name.apply(lambda x: pd.Series(get_video(x)))
+        # Group the files by channel and video_id
+        grouped = file_df.groupby(['video_id'])
+
+        # Iterate and add each subsequent pair of chunks to the chunk_list
+        print("Iterating over videos to find subsequent chunks ...")
+        for video_id, group in tqdm(grouped):
+            group = group.sort_values('chunk_id')
+            for i in range(len(group) - 1):
+                # Add the input and predict chunk file names to the chunk_list
+                input_chunk_file = group.iloc[i].file_name
+                # Randomly choose the next chunk or a random chunk to predict
+                if random() < 0.5:
+                    # Use the next chunk as the predict chunk
+                    predict_chunk_file = group.iloc[i + 1].file_name
+                    is_next_chunk = True
+                else:
+                    # Use a random chunk as the predict chunk
+                    predict_chunk_file = sample(list(group.file_name), 1)[0]
+                    is_next_chunk = False
+                self.chunk_list.append((input_chunk_file, predict_chunk_file, is_next_chunk))
+
+    def __len__(self):
+        return len(self.chunk_list)  # Return the total number of samples in the dataset
 
     def mask_tokens(self, token_ids):
         masked_token_ids = token_ids.clone()  # Create a copy of token ids
-        target = []  # Initialize a list to store the original token ids
 
         # Iterate through the token ids and mask tokens with a probability of self.mask_prob
         for i, token_id in enumerate(token_ids):
             if random() < self.mask_prob:
                 masked_token_ids[i] = MASK_TOKEN_ID  # Replace the token id with mask_token_id
-                target.append(token_id.item())  # Store the original token id in target
-            else:
-                target.append(token_id.item())  # Store the original token id in target
 
-        return masked_token_ids, target
-
-    def __len__(self):
-        return len(self.dataset)  # Return the total number of samples in the dataset
+        return masked_token_ids
 
     def __getitem__(self, idx):
-        token_ids = self.dataset[idx]  # Get the token ids for the current sample
-        masked_token_ids, target_ids = self.mask_tokens(token_ids)  # Mask the tokens in the current sample
-        return masked_token_ids, torch.tensor(target_ids)
+        # Get the input and predict chunk file names, and a flag indicating if the chunk is the next one
+        input_chunk_file, predict_chunk_file, is_next_chunk = self.chunk_list[idx]
+        # Load the token ids from the file
+        input_chunk = torch.load(os.path.join(self.dir_path, input_chunk_file))
+        # Mask some of the tokens in the chunk
+        masked_chunk = self.mask_tokens(input_chunk)
+        # Load the token ids for the chunk we want to predict
+        predict_chunk = torch.load(os.path.join(self.dir_path, predict_chunk_file))
+
+        return input_chunk, masked_chunk, predict_chunk, is_next_chunk
 
 
-class DocumentMLMEmbedder(nn.Module):
+class DocumentEmbedder(nn.Module):
     """Embeds documents using a masked language model for training"""
 
     def __init__(self, vocab_size, embedding_size, num_heads, dim_feedforward, num_layers):
-        super(DocumentMLMEmbedder, self).__init__()
+        super(DocumentEmbedder, self).__init__()
 
         self.embedding = nn.Embedding(vocab_size, embedding_size)
         self.transformer = nn.Transformer(
@@ -139,99 +189,76 @@ class DocumentMLMEmbedder(nn.Module):
             num_decoder_layers=num_layers,
             dim_feedforward=dim_feedforward,
             dropout=0.2,
+            batch_first=True,
         )
         self.fc = nn.Linear(embedding_size, vocab_size)
+
+        # Layer to predict whether the next chunk is a continuation of the current chunk
+        self.next_chunk_classifier = nn.Sequential(
+            nn.Linear(embedding_size*4, 2),
+            nn.Softmax(dim=-1),
+        )
+
         self.idf_weights = None
 
-    def forward(self, x, return_doc_embedding=False):
-        embedded = self.embedding(x)
-        encoded = self.transformer(embedded, embedded)
+    def forward(self, chunk, masked_chunk=None, next_chunk=None, return_doc_embedding=False):
+        """
+        Take document, masked document, and next chunk as input
+        """
+
+        embedded_chunk = self.embedding(chunk)
+        encoded_chunk = self.transformer(embedded_chunk, embedded_chunk)
+        doc_embedding = self.get_doc_embedding(chunk, encoded_chunk)
 
         if return_doc_embedding:
-            # Load the IDF weights if they haven't been loaded yet
-            if self.idf_weights is None:
-                self.idf_weights = np.load(os.path.join("data", "idf_vector.npy"))
-
-            # Create a tensor with the same shape as encoded and fill it with the corresponding IDF values
-            no_idf_tokens = {PAD_TOKEN_ID, MASK_TOKEN_ID, CLS_TOKEN_ID}
-            no_idf_mask = [token_id not in no_idf_tokens for token_id in x]
-            # Create a tensor with the same shape as encoded and fill it with the corresponding IDF values
-            idf_list = [self.idf_weights[token_id] for token_id in x]
-            idf_tensor = torch.tensor(idf_list).unsqueeze(1).repeat(1, encoded.shape[1])[no_idf_mask]
-            # Normalize the IDF tensor
-            idf_tensor = idf_tensor / torch.sum(idf_tensor).item()
-            # Multiply encoded by the IDF tensor
-            idf_weighted_encoded = encoded[no_idf_mask] * idf_tensor
-
-            # Take the mean of the IDF-weighted encoded sequence to get a document-level embedding
-            mean_embedding = torch.mean(idf_weighted_encoded, dim=1)
-            max_embedding = torch.max(encoded[no_idf_mask], dim=1)[0]
-            min_embedding = torch.min(encoded[no_idf_mask], dim=1)[0]
-            std_embedding = torch.std(encoded[no_idf_mask], dim=1)
-            doc_embedding = torch.cat([mean_embedding, max_embedding, min_embedding, std_embedding])
-
             return doc_embedding
 
         # Predict the masked tokens
-        logits = self.fc(encoded)
-        return logits
+        embedded_masked_chunk = self.embedding(masked_chunk)
+        encoded_masked_chunk = self.transformer(embedded_masked_chunk, embedded_masked_chunk)
+        masked_logits = self.fc(encoded_masked_chunk)
 
+        embedded_next_chunk = self.embedding(next_chunk)
+        encoded_next_chunk = self.transformer(embedded_next_chunk, embedded_next_chunk)
+        next_chunk_embedding = self.get_doc_embedding(next_chunk, encoded_next_chunk)
+        # Predict the next chunk
+        next_chunk_prob = self.next_chunk_prediction(doc_embedding, next_chunk_embedding)
 
-class DocumentCleanEmbedder(nn.Module):
-    """This model takes a document as input and outputs a document-level embedding."""
+        return masked_logits, next_chunk_prob
 
-    def __init__(self, vocab_size, embedding_size, num_heads, dim_feedforward, num_layers):
-        super(DocumentCleanEmbedder, self).__init__()
+    def next_chunk_prediction(self, doc_embedding, next_chunk_embedding):
+        concatenated_embeddings = torch.cat((doc_embedding, next_chunk_embedding), dim=1)
+        next_chunk_prob = self.next_chunk_classifier(concatenated_embeddings)
+        return next_chunk_prob
 
-        self.embedding = nn.Embedding(vocab_size, embedding_size)
-        self.transformer = nn.Transformer(
-            d_model=embedding_size,
-            nhead=num_heads,
-            activation='relu',
-            num_encoder_layers=num_layers,
-            num_decoder_layers=num_layers,
-            dim_feedforward=dim_feedforward,
-            dropout=0.2,
-        )
+    def get_doc_embedding(self, x, encoding):
+        # Load the IDF weights if they haven't been loaded yet
+        if self.idf_weights is None:
+            self.idf_weights = np.load(os.path.join("data", "idf_vector.npy"))
 
-    def forward(self, x):
-        """
-        Predict document-level embeddings from a document
-        x is of shape (batch_size, seq_len)
-        """
+        doc_embeddings = None
+        # Iterate through the vectors of x and encoding, each of which represents a document
+        for (x_vec, encoding_vec) in zip(x, encoding):
+            # Get the IDF weights of the tokens in the document
+            idf_weights = torch.tensor(self.idf_weights[x_vec])
+            # Normalize IDF weights and repeat them to match the shape of the encoding vectors
+            idf_weights = (idf_weights / idf_weights.sum()).unsqueeze(1).repeat(1, encoding_vec.shape[1])
+            # Get the average of the encoding vectors weighted by the IDF weights
+            mean_embedding = (encoding_vec * idf_weights).mean(dim=0)
+            max_embedding = encoding_vec.max(dim=0)[0]
+            # min_embedding = encoding_vec.min(dim=0)[0]
+            # std_embedding = encoding_vec.std(dim=0)
+            # Concatenate the mean, max, min, and std embeddings
+            doc_embedding_vec = torch.cat((mean_embedding, max_embedding)).unsqueeze(0)
+            # doc_embedding_vec = torch.cat((mean_embedding, max_embedding, min_embedding, std_embedding)).unsqueeze(0)
 
-        # Embed the input sequence
-        embedded = self.embedding(x)  # shape (batch_size, seq_len, embedding_size)
-        # Encode the input sequence using the transformer's encoder and decoder
-        encoded = self.transformer(embedded, embedded)  # shape (batch_size, seq_len, embedding_size)
-        # Get the output embedding of the [CLS] token (assumed to be at position 0)
-        doc_embedding = encoded[:, 0, :]  # shape (batch_size, embedding_size)
+            # Add the document embedding to the doc_embeddings tensor
+            if doc_embeddings is None:
+                doc_embeddings = doc_embedding_vec
+            else:
+                doc_embeddings = torch.cat((doc_embeddings, doc_embedding_vec))
 
-        return doc_embedding
-
-
-class DocumentEmbeddingAdversary(torch.nn.Module):
-    """This model takes a document embedding as input and outputs a cluster label."""
-
-    def __init__(self, embedding_size, max_clusters=20):
-        super().__init__()
-        # First linear layer: takes input of size embed_dim and maps to embedding_size // 2
-        self.layer1 = torch.nn.Linear(embedding_size, embedding_size // 2)
-        # Second linear layer: takes input of size (embedding_size // 2) and maps it to max_clusters
-        self.cluster_layers = torch.nn.ModuleList([
-            torch.nn.Linear(embedding_size // 2, 1) for _ in range(max_clusters)
-        ])
-
-    def forward(self, x, num_clusters):
-        """Predict cluster label from a document embedding"""
-
-        # Pass input x through the first layer and apply ReLU activation
-        x_relu = torch.relu(self.layer1(x))
-
-        # Pass the output of the first layer through the second layer
-        logits = torch.cat([layer(x_relu) for layer in self.cluster_layers[:num_clusters]], dim=1)
-        # Return logits representing the probability of each cluster
-        return logits
+        return doc_embeddings.to(encoding.dtype)
 
 
 class Int8MinMaxObserver(torch.quantization.MinMaxObserver):
@@ -278,24 +305,18 @@ class DocumentEmbeddingTrainer:
         # Train the DocumentEmbeddingTransformer to generate document embeddings.
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        self.train_dataset = DocumentDataset(os.path.join("data", f"train-{self.chunk_size}"))
-        self.test_dataset = DocumentDataset(os.path.join("data", f"test-{self.chunk_size}"))
+        chunk_dir = os.path.join("data", f"train-{self.chunk_size}")
+        self.doc_dataset = DocumentDataset(chunk_dir)
+        self.predict_dataset = PredictChunkDataset(chunk_dir)
 
-        # Prepare dataset, dataloader, and masking for MLM
-        print("Preparing the masked dataset ...")
-        self.mask_prob = 0.15
-        self.masked_dataset = MaskedTextDataset(self.train_dataset, self.mask_prob)
-        self.masked_dataloader = DataLoader(self.masked_dataset, batch_size=1, shuffle=True)
-        print("Done preparing the masked dataset.")
-
-    def init_mlm(self, batch_size, num_epochs, num_heads, dim_feedforward, num_layers, lr):
+    def init_model(self, batch_size, num_epochs, num_heads, dim_feedforward, num_layers, lr):
         # Create the DocumentMLMEmbedder model
         self.mlm_lr = lr
         self.mlm_epochs = num_epochs
         self.mlm_batch_size = batch_size
 
         print("Creating the MLM model ...")
-        self.model = DocumentMLMEmbedder(
+        self.model = DocumentEmbedder(
             vocab_size=VOCAB_SIZE,
             embedding_size=self.embedding_size,
             num_heads=num_heads,
@@ -303,61 +324,22 @@ class DocumentEmbeddingTrainer:
             num_layers=num_layers,
         ).to(self.device)
 
-    def calc_mlm_loss(self, input_ids, labels, loss_function):
-        # Forward pass to get the logits
-        logits = self.model(input_ids)
+    @staticmethod
+    def calc_loss(logits, targets, loss_function):
         # Calculate the loss
-        batch_size, seq_len = input_ids.shape
+        batch_size, seq_len = targets.shape
         logits_view = logits.view(batch_size * seq_len, -1)
-        labels_view = labels.view(batch_size * seq_len)
+        labels_view = targets.view(batch_size * seq_len)
         loss = loss_function(logits_view, labels_view)
         return loss
 
-    def train_mlm(self, epoch_size=8):
-        self.model.train()
-        total_loss = 0
-        num_batches = 0
-
-        # Create the optimizer and loss function
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.mlm_lr)
-        # Ignore the loss for masked tokens
-        loss_function = torch.nn.CrossEntropyLoss(ignore_index=-1)
-
-        # Sample a random subset of the dataset
-        sample_size = self.mlm_batch_size * epoch_size
-        sample_idxs = sample(range(len(self.masked_dataset)), sample_size)
-
-        for i in range(epoch_size):
-            # Create batch of masked documents, of size self.mlm_batch_size
-            batch_idxs = sample_idxs[i * self.mlm_batch_size: (i + 1) * self.mlm_batch_size]
-            masked_batch = None
-            target_batch = None
-
-            for idx in batch_idxs:
-                masked_tokens, target_tokens = self.masked_dataset[idx]
-                if masked_batch is None:
-                    masked_batch = masked_tokens.unsqueeze(0)
-                    target_batch = target_tokens.unsqueeze(0)
-                else:
-                    masked_batch = torch.concat([masked_batch, masked_tokens.unsqueeze(0)])
-                    target_batch = torch.concat([target_batch, target_tokens.unsqueeze(0)])
-
-            masked_batch = masked_batch.to(self.device)
-            target_batch = target_batch.to(self.device)
-
-            # Clear the gradients before each forward pass
-            optimizer.zero_grad()
-            # Forward pass to get the logits
-            loss = self.calc_mlm_loss(masked_batch, target_batch, loss_function)
-            # Calculate the gradients of the loss with respect to all the parameters
-            loss.backward()
-            # Make a step in the optimizer to update the parameters
-            optimizer.step()
-
-            total_loss += loss.item()
-            num_batches += 1
-
-        return total_loss / num_batches
+    @staticmethod
+    def add_to_batch(batch, vector):
+        if batch is None:
+            batch = vector.unsqueeze(0)
+        else:
+            batch = torch.cat([batch, vector.unsqueeze(0)])
+        return batch
 
     def train(self, batch_size=None, epochs=None, lr=None):
         """Train the DocumentMLMEmbedder model"""
@@ -376,6 +358,7 @@ class DocumentEmbeddingTrainer:
         # Prepare the model for quantization
         self.prepare_for_quantization()
         self.model.to(self.device)
+        self.model.train()
 
         # Create the optimizer and loss function
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.mlm_lr)
@@ -384,36 +367,58 @@ class DocumentEmbeddingTrainer:
         # Read the loss from a file if it exists
         new_loss_df = pd.DataFrame(columns=["run_code", "epoch", "loss"])
 
-        # Train the model
-        for epoch in tqdm(range(self.mlm_epochs)):
-            # Sample [self.mlm_batch_size] random documents from the training dataset
-            sample_indices = sample(range(len(self.train_dataset)), self.mlm_batch_size)
+        # Sample [self.mlm_epochs * self.mlm_batch_size] random documents from the training dataset
+        sample_indices = sample(range(len(self.predict_dataset)), self.mlm_epochs * self.mlm_batch_size)
 
+        # Train the model
+        print("Training the MLM model ...")
+        for epoch in tqdm(range(self.mlm_epochs)):
             total_loss = 0
             num_batches = 0
 
-            for idx in sample_indices:
-                optimizer.zero_grad()
+            optimizer.zero_grad()
+            # The input tokens for the first chunk of each pair
+            batch_chunks = None
+            # The masked tokens for the first chunk of each pair
+            batch_masked_chunks = None
+            # The target tokens for the second chunk of each pair
+            batch_next_chunks = None
+            # Whether the second chunk is the next chunk in the document
+            batch_is_next_chunk = []
 
-                # Get the token ids for the current document
-                token_ids = self.train_dataset[idx]
-
+            epoch_sample_indices = sample_indices[epoch * self.mlm_batch_size:(epoch + 1) * self.mlm_batch_size]
+            for idx in epoch_sample_indices:
                 # Apply masking to the token ids
-                masked_token_ids_tensor, masked_target_ids = self.masked_dataset.mask_tokens(token_ids)
-                # And convert target IDs to tensors
-                target_ids_tensor = torch.tensor(masked_target_ids).unsqueeze(0).to(self.device)
+                input_chunk, masked_chunk, target_chunk, is_next_chunk = self.predict_dataset[idx]
+                batch_chunks = self.add_to_batch(batch_chunks, input_chunk)
+                batch_masked_chunks = self.add_to_batch(batch_masked_chunks, masked_chunk)
+                batch_next_chunks = self.add_to_batch(batch_next_chunks, target_chunk)
+                batch_is_next_chunk.append(is_next_chunk)
 
-                # Forward pass through the model
-                logits = self.model(masked_token_ids_tensor.unsqueeze(0).to(self.device))
+            # Convert the batch to tensors
+            batch_chunks = batch_chunks.to(self.device)
+            batch_masked_chunks = batch_masked_chunks.to(self.device)
+            batch_next_chunks = batch_next_chunks.to(self.device)
 
-                # Calculate the loss
-                loss = loss_function(logits.squeeze(0), target_ids_tensor.squeeze(0))
-                loss.backward()
-                optimizer.step()
+            # Convert batch_is_next_chunk to a tensor
+            batch_is_next_chunk = torch.tensor(batch_is_next_chunk, dtype=torch.float32).to(self.device)
 
-                # Update the total loss and number of batches
-                total_loss += loss.item()
-                num_batches += 1
+            batch_masked_logits, batch_next_logits = self.model(batch_chunks, batch_masked_chunks, batch_next_chunks)
+
+            # Calculate the loss
+            masked_loss = self.calc_loss(batch_masked_logits, batch_chunks, loss_function)
+            predict_loss = loss_function(
+                batch_next_logits[:, 1].unsqueeze(1),  # Use the True prediction logits and reshape
+                batch_is_next_chunk.unsqueeze(1),  # Reshape as a tensor of shape (batch_size, 1)
+            )
+            loss = masked_loss + predict_loss
+
+            loss.backward()
+            optimizer.step()
+
+            # Update the total loss and number of batches
+            total_loss += loss.item()
+            num_batches += 1
 
             # Calculate the average loss over all batches
             avg_loss = total_loss / num_batches
@@ -454,170 +459,8 @@ class DocumentEmbeddingTrainer:
 
         self.model.apply(apply_qconfig)
 
-    def train_adversary(self, pseudo_labels, num_topics, epoch_size=8):
-        """
-        Train the document embedding adversary
-
-        :param pseudo_labels: a dictionary of document ids and their corresponding pseudo labels
-        :param num_topics: the number of topics to use for training
-        :param epoch_size: the number of batches to train per epoch
-
-        :return: the average loss per batch
-        """
-
-        # Set the model to training mode
-        self.adversary.train()
-        total_loss = 0
-        num_batches = 0
-
-        # Create the optimizer and loss function
-        optimizer = torch.optim.Adam(self.adversary.parameters(), lr=self.adversary_lr)
-        loss_function = torch.nn.CrossEntropyLoss(ignore_index=-1)
-
-        for idx, pseudo_label in pseudo_labels.items():
-            input_ids = self.train_dataset[idx]
-            # Move the batch and label to the device
-            input_ids = input_ids.unsqueeze(0).to(self.device)
-            embedding = self.model(input_ids, return_doc_embedding=True)
-            pseudo_label = torch.tensor(pseudo_label).to(self.device)
-
-            # Zero out the gradients
-            optimizer.zero_grad()
-            # Generate the topic logits
-            logits = self.adversary(embedding.unsqueeze(0), num_topics).squeeze().unsqueeze(0)
-            # Calculate the loss comparing the logits to the label
-            loss = loss_function(logits, pseudo_label)
-            # Back-propagate the loss
-            loss.backward()
-            # Update the model parameters
-            optimizer.step()
-
-            # Update the total loss and number of batches
-            total_loss += loss.item()
-            num_batches += 1
-
-            # Stop training if the number of batches exceeds the limit
-            if epoch_size and num_batches >= epoch_size:
-                break
-
-        # Return the average loss
-        return total_loss / num_batches
-
-    def train_combined(self, epoch_size=8):
-        """Reinforcement learning to train the DocumentMLMEmbedder model"""
-
-        # Set both the model and the adversary to training mode
-        self.model.train()
-        self.adversary.train()
-
-        # Create the optimizer and loss function
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.adversary_lr)
-        # Ignore the loss for outliers and masked tokens
-        loss_function = torch.nn.CrossEntropyLoss(ignore_index=-1)
-
-        print("Combined training...")
-        optimizer.zero_grad()
-
-        # Create a list of indices for the training dataset
-        sample_indices = sample(range(len(self.train_dataset)), self.adversary_batch_size)
-        # Get token_ids for the sample_indices of this indices as a tensor
-        # Convert the list of token id tensors to a tensor of token id tensors
-        input_ids = torch.stack([self.train_dataset[idx] for idx in sample_indices])
-        input_ids = input_ids.to(self.device)
-
-        # Get embeddings for the input_ids
-        embeddings = self.model(input_ids, return_doc_embedding=True)
-        # Generate the pseudo-labels
-        pseudo_labels = self.generate_pseudo_labels(embeddings=embeddings, sample_indices=sample_indices)
-        # Get the number of topics from the pseudo-labels
-        topic_set = set(pseudo_labels.values())
-        num_topics = len(topic_set) - 1 if -1 in topic_set else len(topic_set)
-
-        # Skip the batch if there are no topics
-        if num_topics == 0:
-            return None
-
-        adversary_logits = self.adversary(embeddings, num_topics)
-        adversary_targets = torch.tensor(
-            [pseudo_labels[idx] for idx in sample_indices], dtype=torch.long, device=self.device
-        )
-        adversary_loss = loss_function(adversary_logits, adversary_targets)
-
-        # Back-propagate the combined loss
-        adversary_loss.backward()
-
-        # Update the model parameters
-        optimizer.step()
-
-        # Update the total loss and number of batches
-        print(f"Adversary loss: {adversary_loss.item()}")
-        return adversary_loss.item()
-
-    def generate_pseudo_labels(self, sample_size=64, embeddings=None, sample_indices=None):
-        """
-        Generate pseudo-labels for the documents using DBScan.
-        There are two ways to generate pseudo-labels:
-            1. Generate document embeddings for a random subset of the dataset
-            2. Use the document embeddings from the current batch. This is used for reinforcement learning.
-
-        For the first method, supply only the sample_size parameter.
-        For the second method, supply the embeddings and sample_indices parameters.
-
-        :param sample_size: the number of documents to use for generating pseudo-labels
-        :param embeddings: a tensor of document embeddings
-        :param sample_indices: a list of indices for the training dataset
-        :return: a dictionary of document ids and their corresponding pseudo labels
-        """
-
-        # Change the model from training to evaluation mode
-        self.model.eval()
-
-        if embeddings is None:
-            # Generate document embeddings for a random subset of the dataset
-            embeddings = torch.Tensor()
-            dataset_size = len(self.train_dataset)
-
-            if sample_size is None or sample_size > dataset_size:
-                sample_size = dataset_size
-
-            # Choose a random sample of indices from the dataset
-            sample_indices = sample(range(dataset_size), sample_size)
-
-            # Disable gradient calculation to speed up inference
-            with torch.no_grad():
-                print("Generating document embeddings...")
-                for idx in tqdm(sample_indices):
-                    batch = self.train_dataset[idx]
-                    # Generate document embeddings for the documents in the batch
-                    doc_embedding = self.model(batch.unsqueeze(0).to(self.device), return_doc_embedding=True)
-                    embeddings = torch.cat([embeddings, doc_embedding])
-
-        # If the epsilon value is not set, calculate it
-        if self.eps is None:
-            # Get the distance matrix for the document embeddings, using Euclidean distance
-            print("Calculating distance matrix...")
-            self.eps = self.calculate_eps(embeddings)
-            print("EPS: ", self.eps)
-            distance_matrix = euclidean_distances(embeddings.detach().numpy())
-            # Set EPS to the 20% percentile of the distance matrix
-            np_eps = np.percentile(distance_matrix, 20)
-            print("NP EPS: ", np_eps)
-
-        # Use DBScan to cluster the document embeddings
-        # This will generate a list of cluster labels for each document
-        # The label -1 indicates that the document is an outlier
-        db = DBSCAN(eps=self.eps, min_samples=3)
-        # Fit the DBScan model to the document embeddings
-        print("Clustering document embeddings...")
-        db.fit(embeddings.detach().numpy())
-        # create dict of cluster labels
-        doc_labels = {idx: label for idx, label in zip(sample_indices, db.labels_)}
-
-        # Return the document labels
-        return doc_labels
-
-    def load_mlm(self, run_code, vocab_size):
-        """Load the trained model"""
+    def load_model(self, run_code, vocab_size):
+        """Load a trained model"""
 
         # Get configuration
         run_config_df = pd.read_csv("runs.csv")
@@ -629,7 +472,7 @@ class DocumentEmbeddingTrainer:
         self.mlm_lr = run_config["lr"]
 
         # Load the model
-        self.model = DocumentMLMEmbedder(
+        self.model = DocumentEmbedder(
             vocab_size=vocab_size,
             embedding_size=run_config["embedding_size"],
             num_heads=run_config["num_heads"],
@@ -644,87 +487,6 @@ class DocumentEmbeddingTrainer:
 
         # Load the model state dictionary
         self.model.load_state_dict(torch.load(os.path.join("data", "models", f"mlm_{run_code}.pt")))
-
-    def init_reinforce(self, embedding_size, max_topics, adv_epochs=100, adv_batch_size=64, adv_lr=1e-3,
-                       comb_epochs=100):
-        """Initialize the document embedding adversary and reinforcement learning parameters"""
-
-        self.adversary = DocumentEmbeddingAdversary(embedding_size, max_topics)
-        self.adversary.to(self.device)
-        self.adversary_epochs = adv_epochs
-        self.adversary_batch_size = adv_batch_size
-        self.adversary_lr = adv_lr
-        self.combined_epochs = comb_epochs
-
-    def reinforce(self, run_code, epochs=100):
-        """
-        Use reinforcement learning to train DocumentMLMEmbedder to model topics.
-        :param run_code: The run code for the MLM-trained DocumentMLMEmbedder model to use.
-        :param epochs: The number of epochs to train the adversary.
-        """
-
-        # Load the chunk size from runs.csv
-        run_log_df = pd.read_csv("runs.csv")
-        run_log_df = run_log_df[run_log_df["run_code"] == run_code]
-        self.chunk_size = run_log_df["chunk_size"].values[0]
-        self.embedding_size = run_log_df["embedding_size"].values[0]
-
-        # Load the pre-trained DocumentEmbeddingTransformer model from the run code
-        print("Loading the DocumentMLMEmbedder model ...")
-        self.load_mlm(run_code, VOCAB_SIZE)
-
-        epoch = 0
-        while epoch < epochs:
-            print(f"Starting Reinforcement Epoch {epoch + 1} ...")
-
-            # 2. Generate pseudo-labels for the documents using DBScan
-            print("Generating pseudo-labels ...")
-            pseudo_labels = self.generate_pseudo_labels(sample_size=256)
-            # Get the number of topics from the pseudo-labels. The indices and labels are zipped together
-            topic_set = set(pseudo_labels.values())
-            num_topics = len(topic_set) - 1 if -1 in topic_set else len(topic_set)
-
-            # Only train the adversary on the first iteration
-            if epoch == 0:
-                # 3. Train the DocumentEmbeddingAdversary model to predict the pseudo-labels for the documents.
-                print("Training the DocumentEmbeddingAdversary model ...")
-                # Train the DocumentEmbeddingAdversary model using the pseudo-labels as the target
-                self.train_adversary(pseudo_labels, num_topics=num_topics)
-
-            # 4. Update the DocumentMLMEmbedder using a combined loss that includes the original loss and an
-            # adversarial loss based on the DocumentEmbeddingAdversary's predictions.
-            print("Updating the DocumentMLMEmbedder model ...")
-            combined_loss = self.train_combined()
-            if combined_loss is None:
-                print("Combined loss is None. Skipping this epoch.")
-                continue
-
-            # 5. Update the MLM model parameters with reference to the loss
-
-            epoch += 1
-            print(f"Combined loss: {combined_loss}")
-
-    @staticmethod
-    def calculate_eps(embeddings, percent=20):
-        """Calculate the epsilon value for DBScan clustering"""
-
-        # Calculate the distance matrix for the document embeddings
-        distances = dict()
-        # Iterate over all document pairs
-        for idx, embed_i in tqdm(enumerate(embeddings)):
-            for jdx, embed_j in enumerate(embeddings):
-                # Skip if the pair has already been calculated or if the pair is the same document
-                if (idx, jdx) in distances or (jdx, idx) in distances or idx == jdx:
-                    continue
-
-                # p determines the Minkowski order. 2 is Euclidean, 1 is Manhattan. etc.
-                distances[(idx, jdx)] = torch.cdist(
-                    embed_i.unsqueeze(0), embed_j.unsqueeze(0), p=2
-                ).item()
-
-        # Get the 20th percentile of the distances, should be conducive for 5-10 topics
-        distances = list(distances.values())
-        return np.percentile(distances, percent)
 
 
 def convert_to_quantized(model):
@@ -761,25 +523,26 @@ def chunk_data(chunk_size):
             doc = f.read()
 
         # Tokenize the document, and get the integer token ids
-        doc_embeddings = [EMBED_VOCAB.stoi[token] for token in word_tokenize(doc) if token in EMBED_VOCAB.stoi]
+        doc_tokens = [EMBED_VOCAB.stoi[token] for token in word_tokenize(doc) if token in EMBED_VOCAB.stoi]
+
+        # Generate random number to determine if this file is in the train or test set
+        if random() < 0.8:
+            chunk_dir = train_dir
+        else:
+            chunk_dir = test_dir
 
         # Chunk the document into CHUNK_SIZE-1 token chunks
-        for i in range(0, len(doc_embeddings), chunk_size):
-            # Generate random number to determine if this chunk is in the train or test set
-            if random() < 0.8:
-                chunk_dir = train_dir
-            else:
-                chunk_dir = test_dir
+        for i in range(0, len(doc_tokens), chunk_size):
 
             # Convert tokens to embeddings
-            embeddings = torch.tensor([embedding for embedding in doc_embeddings[i:i+chunk_size]])
+            embeddings = torch.tensor([embedding for embedding in doc_tokens[i:i+chunk_size]])
             # Pad the chunk with PAD_TOKEN_ID if it is smaller than CHUNK_SIZE
             embeddings = torch.nn.functional.pad(
                 embeddings, (0, chunk_size - len(embeddings)), "constant", PAD_TOKEN_ID
             )
 
             # Save the chunk
-            torch.save(embeddings, os.path.join(chunk_dir, f"{filename}_{i}.pt"))
+            torch.save(embeddings, os.path.join(chunk_dir, f"{filename}_{i//chunk_size:04d}.pt"))
 
 
 def record_run(run_code, chunk_size, batch_size, epochs, embedding_size, num_heads, dim_feedforward, num_layers, lr):
@@ -829,25 +592,17 @@ if __name__ == "__main__":
     parser.add_argument("--reinforce", action="store_true")
 
     # Model hyper-parameters
-    parser.add_argument("--chunk-size", type=int, default=128)
+    parser.add_argument("--chunk-size", type=int, default=64)
 
-    # MLM training hyper-parameters
-    train_group = parser.add_argument_group("mlm training")
+    # Model training hyper-parameters
+    train_group = parser.add_argument_group("model training")
     train_group.add_argument("--batch-size", type=int, default=8)
     train_group.add_argument("--dim-feedforward", type=int, default=512)
-    train_group.add_argument("--epochs", type=int, default=100)
+    train_group.add_argument("--epochs", type=int, default=9000)
     train_group.add_argument("--embedding-size", type=int, default=128)
     train_group.add_argument("--num-heads", type=int, default=4)
     train_group.add_argument("--num-layers", type=int, default=2)
     train_group.add_argument("--lr", type=float, default=1e-4)
-
-    # Reinforcement learning hyper-parameters
-    reinforce_group = parser.add_argument_group("reinforcement")
-    reinforce_group.add_argument("--max-topics", type=int, default=20)
-    reinforce_group.add_argument("--adv-epochs", type=int, default=10)
-    reinforce_group.add_argument("--adv-batch-size", type=int, default=16)
-    reinforce_group.add_argument("--adv-lr", type=float, default=1e-3)
-    reinforce_group.add_argument("--comb-epochs", type=int, default=100)
 
     # Run code to load a trained model
     parser.add_argument("--run-code", type=str, default=None)
@@ -865,7 +620,7 @@ if __name__ == "__main__":
         trainer = DocumentEmbeddingTrainer(
             chunk_size=pargs.chunk_size, embedding_size=pargs.embedding_size
         )
-        trainer.init_mlm(
+        trainer.init_model(
             batch_size=pargs.batch_size, num_epochs=pargs.epochs, num_heads=pargs.num_heads,
             dim_feedforward=pargs.dim_feedforward, num_layers=pargs.num_layers, lr=pargs.lr
         )
@@ -875,22 +630,3 @@ if __name__ == "__main__":
             trainer.run_code, pargs.chunk_size, pargs.batch_size, pargs.epochs, pargs.embedding_size, pargs.num_heads,
             pargs.dim_feedforward, pargs.num_layers, pargs.lr
         )
-
-    # Reinforce the model
-    if pargs.reinforce:
-        print("Reinforcing model...")
-
-        if pargs.run_code is None:
-            raise ValueError("Must specify run code to reinforce model")
-
-        # Load the run config
-        my_run_config = load_run_config(pargs.run_code)
-
-        if trainer is None:
-            trainer = DocumentEmbeddingTrainer(run_code=pargs.run_code)
-            trainer.load_mlm(run_code=pargs.run_code, vocab_size=VOCAB_SIZE)
-        trainer.init_reinforce(
-            embedding_size=my_run_config.embedding_size, max_topics=pargs.max_topics, adv_epochs=pargs.adv_epochs,
-            adv_batch_size=pargs.adv_batch_size, adv_lr=pargs.adv_lr, comb_epochs=pargs.comb_epochs
-        )
-        trainer.reinforce(run_code=pargs.run_code)
