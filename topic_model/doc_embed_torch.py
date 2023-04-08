@@ -236,7 +236,7 @@ class DocumentMLMEmbedder(nn.Module):
                 idf_tensor = torch.tensor(idf_list).unsqueeze(1).repeat(1, encoded_doc.shape[1])
                 # Take the mean of the IDF-weighted encoded sequence to get a document-level embedding
                 doc_embedding = (encoded_doc * idf_tensor).mean(dim=1).squeeze(0)
-                batch_embeddings = DocumentEmbeddingTrainer.add_to_batch(batch_embeddings, doc_embedding)
+                batch_embeddings = add_to_batch(batch_embeddings, doc_embedding)
 
             return batch_embeddings
 
@@ -414,14 +414,6 @@ class DocumentEmbeddingTrainer:
         loss = loss_function(logits_view, labels_view)
         return loss
 
-    @staticmethod
-    def add_to_batch(batch, vector):
-        if batch is None:
-            batch = vector.unsqueeze(0)
-        else:
-            batch = torch.cat([batch, vector.unsqueeze(0)])
-        return batch
-
     def train_dual(self):
         """Train the DocumentDualEmbedder model"""
 
@@ -463,9 +455,9 @@ class DocumentEmbeddingTrainer:
             for idx in epoch_sample_indices:
                 # Apply masking to the token ids
                 input_chunk, masked_chunk, target_chunk, is_next_chunk = self.predict_dataset[idx]
-                batch_chunks = self.add_to_batch(batch_chunks, input_chunk)
-                batch_masked_chunks = self.add_to_batch(batch_masked_chunks, masked_chunk)
-                batch_next_chunks = self.add_to_batch(batch_next_chunks, target_chunk)
+                batch_chunks = add_to_batch(batch_chunks, input_chunk)
+                batch_masked_chunks = add_to_batch(batch_masked_chunks, masked_chunk)
+                batch_next_chunks = add_to_batch(batch_next_chunks, target_chunk)
                 batch_is_next_chunk.append(is_next_chunk)
 
             # Convert the batch to tensors
@@ -538,10 +530,10 @@ class DocumentEmbeddingTrainer:
 
                 # Apply masking to the token ids
                 masked_token_ids_tensor, masked_target_ids = self.masked_dataset.mask_tokens(token_ids)
-                batch_masked = self.add_to_batch(batch_masked, masked_token_ids_tensor)
+                batch_masked = add_to_batch(batch_masked, masked_token_ids_tensor)
                 # And convert target IDs to tensors
                 target_ids_tensor = torch.tensor(masked_target_ids)
-                batch_targets = self.add_to_batch(batch_targets, target_ids_tensor)
+                batch_targets = add_to_batch(batch_targets, target_ids_tensor)
 
             # Forward pass through the model
             batch_logits = self.model(batch_masked.to(self.device)).to(self.device)
@@ -623,6 +615,14 @@ class DocumentEmbeddingTrainer:
 
         # Load the model state dictionary
         self.model.load_state_dict(torch.load(os.path.join("data", "models", f"{self.model_type}_{run_code}.pt")))
+
+
+def add_to_batch(batch, vector):
+    if batch is None:
+        batch = vector.unsqueeze(0)
+    else:
+        batch = torch.cat([batch, vector.unsqueeze(0)])
+    return batch
 
 
 def convert_to_quantized(model):
