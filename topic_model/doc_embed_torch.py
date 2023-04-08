@@ -647,19 +647,31 @@ def chunk_data(chunk_size):
     os.makedirs(test_dir, exist_ok=True)
 
     # Empty directories
-    for filename in os.listdir(train_dir):
+    print("Emptying train directory ...")
+    for filename in tqdm(os.listdir(train_dir)):
         os.remove(os.path.join(train_dir, filename))
-    for filename in os.listdir(test_dir):
+    print("Emptying test directory ...")
+    for filename in tqdm(os.listdir(test_dir)):
         os.remove(os.path.join(test_dir, filename))
 
+    # Pre-compute sequential chunks in each document for the PredictChunkDataset class
+    sequential_chunks = {
+        'chunk_a': [],
+        'chunk_b': [],
+        'is_train': [],
+    }
+
     # Iterate over each document, with tqdm to show progress
+    print("Creating document chunks ...")
     for filename in tqdm(os.listdir(os.path.join("data", "youtube", "raw"))):
         # Load the document
         with open(os.path.join("data", "youtube", "raw", filename), "r") as f:
             doc = f.read()
 
         # Tokenize the document, and get the integer token ids
-        doc_tokens = [EMBED_VOCAB.stoi[token] for token in word_tokenize(doc) if token in EMBED_VOCAB.stoi]
+        tokenized_doc = word_tokenize(doc)
+        doc_tokens = [EMBED_VOCAB.stoi[token] for token in tokenized_doc if token in EMBED_VOCAB.stoi]
+        doc_words = [token for token in tokenized_doc if token in EMBED_VOCAB.stoi]
 
         # Generate random number to determine if this file is in the train or test set
         if random() < 0.8:
@@ -669,6 +681,7 @@ def chunk_data(chunk_size):
 
         # Chunk the document into CHUNK_SIZE-1 token chunks
         for i in range(0, len(doc_tokens), chunk_size):
+            chunk_id = i // chunk_size
 
             # Convert tokens to embeddings
             embeddings = torch.tensor([embedding for embedding in doc_tokens[i:i+chunk_size]])
@@ -677,8 +690,22 @@ def chunk_data(chunk_size):
                 embeddings, (0, chunk_size - len(embeddings)), "constant", PAD_TOKEN_ID
             )
 
+            chunk_name = f"{filename}_{chunk_id:04d}"
+            if chunk_id > 0:
+                sequential_chunks['chunk_a'].append(f"{filename}_{chunk_id - 1:04d}")
+                sequential_chunks['chunk_b'].append(chunk_name)
+                sequential_chunks['is_train'].append(chunk_dir == train_dir)
+
             # Save the chunk
-            torch.save(embeddings, os.path.join(chunk_dir, f"{filename}_{i//chunk_size:04d}.pt"))
+            torch.save(embeddings, os.path.join(chunk_dir, f"{chunk_name}.pt"))
+
+            # Save the chunk as a text file
+            with open(os.path.join(chunk_dir, f"{chunk_name}.txt"), "w") as f:
+                f.write(" ".join(doc_words[i:i+chunk_size]))
+
+    # Save the sequential chunks
+    sequential_chunks_df = pd.DataFrame(sequential_chunks)
+    sequential_chunks_df.to_csv(os.path.join("data", f"sequential-chunks-{chunk_size}.csv"), index=False)
 
 
 def record_run(run_code, chunk_size, batch_size, epochs, embedding_size, num_heads, dim_feedforward, num_layers, lr):
