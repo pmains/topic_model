@@ -230,14 +230,15 @@ class DocumentMLMEmbedder(nn.Module):
                 self.idf_weights = np.load(os.path.join("data", "idf_vector.npy"))
 
             # Create a tensor with the same shape as encoded and fill it with the corresponding IDF values
-            idf_list = [self.idf_weights[token_id] for token_id in x]
-            idf_tensor = torch.tensor(idf_list).unsqueeze(1).repeat(1, encoded.shape[1])
-            # Multiply encoded by the IDF tensor
-            idf_weighted_encoded = encoded * idf_tensor
-            # Take the mean of the IDF-weighted encoded sequence to get a document-level embedding
-            doc_embedding = torch.mean(idf_weighted_encoded, dim=1)
+            batch_embeddings = None
+            for encoded_doc, doc in zip(encoded, x):
+                idf_list = [self.idf_weights[token_id] for token_id in doc]
+                idf_tensor = torch.tensor(idf_list).unsqueeze(1).repeat(1, encoded_doc.shape[1])
+                # Take the mean of the IDF-weighted encoded sequence to get a document-level embedding
+                doc_embedding = (encoded_doc * idf_tensor).mean(dim=1).squeeze(0)
+                batch_embeddings = DocumentEmbeddingTrainer.add_to_batch(batch_embeddings, doc_embedding)
 
-            return doc_embedding
+            return batch_embeddings
 
         # Predict the masked tokens
         logits = self.fc(encoded)
@@ -598,25 +599,21 @@ class DocumentEmbeddingTrainer:
 
         self.model.apply(apply_qconfig)
 
-    def load_model(self, run_code, vocab_size):
+    def load_model(self, run_code, vocab_size=VOCAB_SIZE):
         """Load a trained model"""
 
         # Get configuration
         run_config_df = pd.read_csv("runs.csv")
         run_config = run_config_df[run_config_df["run_code"] == run_code].iloc[0]
 
-        self.embedding_size = run_config["embedding_size"]
-        self.epochs = run_config["epochs"]
-        self.batch_size = run_config["batch_size"]
-        self.lr = run_config["lr"]
+        self.embedding_size = run_config.embedding_size
+        self.epochs = run_config.epochs
+        self.batch_size = run_config.batch_size
+        self.lr = run_config.lr
 
-        # Load the model
-        self.model = DocumentDualEmbedder(
-            vocab_size=vocab_size,
-            embedding_size=run_config["embedding_size"],
-            num_heads=run_config["num_heads"],
-            dim_feedforward=run_config["dim_feedforward"],
-            num_layers=run_config["num_layers"],
+        self.init_model(
+            batch_size=run_config.batch_size, num_epochs=run_config.epochs, num_heads=run_config.num_heads,
+            dim_feedforward=run_config.dim_feedforward, num_layers=run_config.num_layers, lr=run_config.lr
         )
 
         print("Preparing the model for quantization ...")
