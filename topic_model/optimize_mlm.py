@@ -30,7 +30,7 @@ def objective(lr, chunk_size, num_layers, batch_size, embedding_size, num_heads,
     # Create a new instance of the trainer with the specified hyper-parameters
     trainer = DocumentEmbeddingTrainer(chunk_size=chunk_size, embedding_size=embedding_size)
     epochs = 100
-    trainer.init_model(
+    trainer.init_dual(
         batch_size=batch_size,
         num_epochs=epochs,
         num_heads=num_heads,
@@ -45,7 +45,7 @@ def objective(lr, chunk_size, num_layers, batch_size, embedding_size, num_heads,
     )
 
     # Train the model
-    trainer.train()
+    trainer.train_dual()
 
     # Read the loss from the file and return the minimum loss
     loss_df = pd.read_csv("loss.csv")

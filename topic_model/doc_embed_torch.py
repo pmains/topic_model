@@ -99,6 +99,34 @@ class DocumentDataset(Dataset):
         return token_ids
 
 
+class MaskedTextDataset(Dataset):
+    def __init__(self, dataset, mask_prob=0.15):
+        self.dataset = dataset  # Original dataset containing token ids
+        self.mask_prob = mask_prob  # Probability of masking a token
+
+    def mask_tokens(self, token_ids):
+        masked_token_ids = token_ids.clone()  # Create a copy of token ids
+        target = []  # Initialize a list to store the original token ids
+
+        # Iterate through the token ids and mask tokens with a probability of self.mask_prob
+        for i, token_id in enumerate(token_ids):
+            if random() < self.mask_prob:
+                masked_token_ids[i] = MASK_TOKEN_ID  # Replace the token id with mask_token_id
+                target.append(token_id.item())  # Store the original token id in target
+            else:
+                target.append(token_id.item())  # Store the original token id in target
+
+        return masked_token_ids, target
+
+    def __len__(self):
+        return len(self.dataset)  # Return the total number of samples in the dataset
+
+    def __getitem__(self, idx):
+        token_ids = self.dataset[idx]  # Get the token ids for the current sample
+        masked_token_ids, target_ids = self.mask_tokens(token_ids)  # Mask the tokens in the current sample
+        return masked_token_ids, torch.tensor(target_ids)
+
+
 class PredictChunkDataset(Dataset):
     def __init__(self, dir_path, mask_prob=0.15):
         """
@@ -174,11 +202,53 @@ class PredictChunkDataset(Dataset):
         return input_chunk, masked_chunk, predict_chunk, is_next_chunk
 
 
-class DocumentEmbedder(nn.Module):
+class DocumentMLMEmbedder(nn.Module):
     """Embeds documents using a masked language model for training"""
 
     def __init__(self, vocab_size, embedding_size, num_heads, dim_feedforward, num_layers):
-        super(DocumentEmbedder, self).__init__()
+        super(DocumentMLMEmbedder, self).__init__()
+
+        self.embedding = nn.Embedding(vocab_size, embedding_size)
+        self.transformer = nn.Transformer(
+            d_model=embedding_size,
+            nhead=num_heads,
+            activation='gelu',
+            num_encoder_layers=num_layers,
+            num_decoder_layers=num_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=0.2,
+        )
+        self.fc = nn.Linear(embedding_size, vocab_size)
+        self.idf_weights = None
+
+    def forward(self, x, return_doc_embedding=False):
+        embedded = self.embedding(x)
+        encoded = self.transformer(embedded, embedded)
+
+        if return_doc_embedding:
+            if self.idf_weights is None:
+                self.idf_weights = np.load(os.path.join("data", "idf_vector.npy"))
+
+            # Create a tensor with the same shape as encoded and fill it with the corresponding IDF values
+            idf_list = [self.idf_weights[token_id] for token_id in x]
+            idf_tensor = torch.tensor(idf_list).unsqueeze(1).repeat(1, encoded.shape[1])
+            # Multiply encoded by the IDF tensor
+            idf_weighted_encoded = encoded * idf_tensor
+            # Take the mean of the IDF-weighted encoded sequence to get a document-level embedding
+            doc_embedding = torch.mean(idf_weighted_encoded, dim=1)
+
+            return doc_embedding
+
+        # Predict the masked tokens
+        logits = self.fc(encoded)
+        return logits
+
+
+class DocumentDualEmbedder(nn.Module):
+    """Embeds documents using a masked language model for training"""
+
+    def __init__(self, vocab_size, embedding_size, num_heads, dim_feedforward, num_layers):
+        super(DocumentDualEmbedder, self).__init__()
 
         self.embedding = nn.Embedding(vocab_size, embedding_size)
         self.transformer = nn.Transformer(
@@ -276,7 +346,7 @@ class Int8MinMaxObserver(torch.quantization.MinMaxObserver):
 class DocumentEmbeddingTrainer:
     """This class handles training and evaluation of the document embedding model"""
 
-    def __init__(self, chunk_size=None, embedding_size=None, run_code=None):
+    def __init__(self, chunk_size=None, embedding_size=None, run_code=None, model_type=None):
         if run_code is None:
             self.run_code = gen_run_code()
             self.chunk_size = chunk_size
@@ -292,37 +362,47 @@ class DocumentEmbeddingTrainer:
         self.eps = None
 
         # Hyper-parameters
-        self.mlm_lr = None
-        self.mlm_epochs = None
-        self.mlm_batch_size = None
-
-        self.adversary_lr = None
-        self.adversary_epochs = None
-        self.adversary_batch_size = None
-
-        self.combined_epochs = None
+        self.lr = None
+        self.epochs = None
+        self.batch_size = None
 
         # Train the DocumentEmbeddingTransformer to generate document embeddings.
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        chunk_dir = os.path.join("data", f"train-{self.chunk_size}")
-        self.doc_dataset = DocumentDataset(chunk_dir)
-        self.predict_dataset = PredictChunkDataset(chunk_dir)
+        self.chunk_dir = os.path.join("data", f"train-{self.chunk_size}")
+        self.doc_dataset = DocumentDataset(self.chunk_dir)
+        self.masked_dataset = None
+        self.predict_dataset = None
+        self.model_type = model_type
 
     def init_model(self, batch_size, num_epochs, num_heads, dim_feedforward, num_layers, lr):
-        # Create the DocumentMLMEmbedder model
-        self.mlm_lr = lr
-        self.mlm_epochs = num_epochs
-        self.mlm_batch_size = batch_size
+        # Create the DocumentDualEmbedder model
+        self.lr = lr
+        self.epochs = num_epochs
+        self.batch_size = batch_size
 
-        print("Creating the MLM model ...")
-        self.model = DocumentEmbedder(
-            vocab_size=VOCAB_SIZE,
-            embedding_size=self.embedding_size,
-            num_heads=num_heads,
-            dim_feedforward=dim_feedforward,
-            num_layers=num_layers,
-        ).to(self.device)
+        if self.model_type == "dual":
+            self.predict_dataset = PredictChunkDataset(self.chunk_dir)
+
+            print("Creating the Dual model ...")
+            self.model = DocumentDualEmbedder(
+                vocab_size=VOCAB_SIZE,
+                embedding_size=self.embedding_size,
+                num_heads=num_heads,
+                dim_feedforward=dim_feedforward,
+                num_layers=num_layers,
+            ).to(self.device)
+        else:
+            self.masked_dataset = MaskedTextDataset(self.chunk_dir)
+
+            print("Creating the MLM model ...")
+            self.model = DocumentMLMEmbedder(
+                vocab_size=VOCAB_SIZE,
+                embedding_size=self.embedding_size,
+                num_heads=num_heads,
+                dim_feedforward=dim_feedforward,
+                num_layers=num_layers,
+            ).to(self.device)
 
     @staticmethod
     def calc_loss(logits, targets, loss_function):
@@ -341,19 +421,11 @@ class DocumentEmbeddingTrainer:
             batch = torch.cat([batch, vector.unsqueeze(0)])
         return batch
 
-    def train(self, batch_size=None, epochs=None, lr=None):
-        """Train the DocumentMLMEmbedder model"""
+    def train_dual(self):
+        """Train the DocumentDualEmbedder model"""
 
         if self.model is None:
-            raise ValueError("The model has not been initialized. Call init_mlm() or load_mlm() first.")
-
-        # Set the batch size, epochs, and learning rate
-        if batch_size is not None:
-            self.mlm_batch_size = batch_size
-        if epochs is not None:
-            self.mlm_epochs = epochs
-        if lr is not None:
-            self.mlm_lr = lr
+            raise ValueError("The model has not been initialized. Call init_dual() or load_model() first.")
 
         # Prepare the model for quantization
         self.prepare_for_quantization()
@@ -361,18 +433,18 @@ class DocumentEmbeddingTrainer:
         self.model.train()
 
         # Create the optimizer and loss function
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.mlm_lr)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         loss_function = torch.nn.CrossEntropyLoss(ignore_index=-1)
 
         # Read the loss from a file if it exists
         new_loss_df = pd.DataFrame(columns=["run_code", "epoch", "loss"])
 
-        # Sample [self.mlm_epochs * self.mlm_batch_size] random documents from the training dataset
-        sample_indices = sample(range(len(self.predict_dataset)), self.mlm_epochs * self.mlm_batch_size)
+        # Sample [self.epochs * self.batch_size] random documents from the training dataset
+        sample_indices = sample(range(len(self.predict_dataset)), self.epochs * self.batch_size)
 
         # Train the model
-        print("Training the MLM model ...")
-        for epoch in tqdm(range(self.mlm_epochs)):
+        print("Training the Dual model ...")
+        for epoch in tqdm(range(self.epochs)):
             total_loss = 0
             num_batches = 0
 
@@ -386,7 +458,7 @@ class DocumentEmbeddingTrainer:
             # Whether the second chunk is the next chunk in the document
             batch_is_next_chunk = []
 
-            epoch_sample_indices = sample_indices[epoch * self.mlm_batch_size:(epoch + 1) * self.mlm_batch_size]
+            epoch_sample_indices = sample_indices[epoch * self.batch_size:(epoch + 1) * self.batch_size]
             for idx in epoch_sample_indices:
                 # Apply masking to the token ids
                 input_chunk, masked_chunk, target_chunk, is_next_chunk = self.predict_dataset[idx]
@@ -428,12 +500,79 @@ class DocumentEmbeddingTrainer:
                 new_loss_df, pd.DataFrame([[self.run_code, epoch + 1, avg_loss]], columns=["run_code", "epoch", "loss"])
             ], ignore_index=True)
 
+        self.save_loss(new_loss_df)
+        self.save_model()
+
+    def train_mlm(self):
+        """Train the DocumentMLMEmbedder model"""
+
+        if self.model is None:
+            raise ValueError("The model has not been initialized. Call init_mlm() or load_model() first.")
+
+        # Prepare the model for quantization
+        self.prepare_for_quantization()
+        self.model.to(self.device)
+
+        # Create the optimizer and loss function
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        loss_function = torch.nn.CrossEntropyLoss(ignore_index=-1)
+
+        # Read the loss from a file if it exists
+        new_loss_df = pd.DataFrame(columns=["run_code", "epoch", "loss"])
+
+        # Train the model
+        print("Training the MLM model ...")
+        for epoch in tqdm(range(self.epochs)):
+            # Sample [self.mlm_batch_size] random documents from the training dataset
+            sample_indices = sample(range(len(self.doc_dataset)), self.batch_size)
+
+            batch_targets = None
+            batch_masked = None
+
+            for idx in sample_indices:
+                optimizer.zero_grad()
+
+                # Get the token ids for the current document
+                token_ids = self.doc_dataset[idx]
+
+                # Apply masking to the token ids
+                masked_token_ids_tensor, masked_target_ids = self.masked_dataset.mask_tokens(token_ids)
+                batch_masked = self.add_to_batch(batch_masked, masked_token_ids_tensor)
+                # And convert target IDs to tensors
+                target_ids_tensor = torch.tensor(masked_target_ids)
+                batch_targets = self.add_to_batch(batch_targets, target_ids_tensor)
+
+            # Forward pass through the model
+            batch_logits = self.model(batch_masked.to(self.device)).to(self.device)
+
+            # Calculate the loss
+            batch_logits_flat = batch_logits.view(-1, batch_logits.shape[-1])
+            batch_targets_flat = batch_targets.view(-1)
+            loss = loss_function(batch_logits_flat, batch_targets_flat)
+            loss.backward()
+            optimizer.step()
+
+            # Use pd.concat to append the new loss data to the existing loss data
+            new_loss_df = pd.concat([new_loss_df, pd.DataFrame(
+                [[self.run_code, epoch + 1, loss.item()]], columns=["run_code", "epoch", "loss"]
+            )], ignore_index=True)
+
+        self.save_loss(new_loss_df)
+        self.save_model()
+
+    @staticmethod
+    def save_loss(new_loss_df):
+        """Save the loss data to a file"""
+
         # Save loss data to a file
         if os.path.exists("loss.csv"):
             loss_df = pd.concat([pd.read_csv("loss.csv"), new_loss_df], ignore_index=True)
         else:
             loss_df = new_loss_df
         loss_df.to_csv("loss.csv", index=False)
+
+    def save_model(self):
+        """Save the model to a file"""
 
         # Make sure the models directory exists
         if not os.path.exists(os.path.join("data", "models")):
@@ -442,7 +581,7 @@ class DocumentEmbeddingTrainer:
         # Save the model
         torch.save(
             self.model.state_dict(),
-            os.path.join("data", "models", f"mlm_{self.run_code}.pt")
+            os.path.join("data", "models", f"{self.model_type}_{self.run_code}.pt")
         )
 
     def prepare_for_quantization(self):
@@ -467,12 +606,12 @@ class DocumentEmbeddingTrainer:
         run_config = run_config_df[run_config_df["run_code"] == run_code].iloc[0]
 
         self.embedding_size = run_config["embedding_size"]
-        self.mlm_epochs = run_config["epochs"]
-        self.mlm_batch_size = run_config["batch_size"]
-        self.mlm_lr = run_config["lr"]
+        self.epochs = run_config["epochs"]
+        self.batch_size = run_config["batch_size"]
+        self.lr = run_config["lr"]
 
         # Load the model
-        self.model = DocumentEmbedder(
+        self.model = DocumentDualEmbedder(
             vocab_size=vocab_size,
             embedding_size=run_config["embedding_size"],
             num_heads=run_config["num_heads"],
@@ -486,7 +625,7 @@ class DocumentEmbeddingTrainer:
         self.model.to(device)
 
         # Load the model state dictionary
-        self.model.load_state_dict(torch.load(os.path.join("data", "models", f"mlm_{run_code}.pt")))
+        self.model.load_state_dict(torch.load(os.path.join("data", "models", f"{self.model_type}_{run_code}.pt")))
 
 
 def convert_to_quantized(model):
@@ -591,6 +730,9 @@ if __name__ == "__main__":
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--reinforce", action="store_true")
 
+    # Add argument to choose either MLM or Dual model
+    parser.add_argument("--model-type", type=str, default="dual")
+
     # Model hyper-parameters
     parser.add_argument("--chunk-size", type=int, default=64)
 
@@ -598,7 +740,7 @@ if __name__ == "__main__":
     train_group = parser.add_argument_group("model training")
     train_group.add_argument("--batch-size", type=int, default=8)
     train_group.add_argument("--dim-feedforward", type=int, default=512)
-    train_group.add_argument("--epochs", type=int, default=9000)
+    train_group.add_argument("--epochs", type=int, default=100)
     train_group.add_argument("--embedding-size", type=int, default=128)
     train_group.add_argument("--num-heads", type=int, default=4)
     train_group.add_argument("--num-layers", type=int, default=2)
@@ -616,16 +758,26 @@ if __name__ == "__main__":
     # Train the model
     trainer = None
     if pargs.train:
-        print("Training model...")
+        # Check that the model type is valid
+        if pargs.model_type not in ("mlm", "dual"):
+            raise ValueError(f"Invalid model type: {pargs.model}. Must be 'mlm' or 'dual'.")
+
         trainer = DocumentEmbeddingTrainer(
-            chunk_size=pargs.chunk_size, embedding_size=pargs.embedding_size
+            chunk_size=pargs.chunk_size, embedding_size=pargs.embedding_size, model_type=pargs.model_type
         )
         trainer.init_model(
             batch_size=pargs.batch_size, num_epochs=pargs.epochs, num_heads=pargs.num_heads,
             dim_feedforward=pargs.dim_feedforward, num_layers=pargs.num_layers, lr=pargs.lr
         )
-        trainer.train()
 
+        # Train the MLM model
+        if pargs.model_type == "mlm":
+            trainer.train_mlm()
+        # Train the dual model
+        elif pargs.model_type == "dual":
+            trainer.train_dual()
+
+        # Record the run results
         record_run(
             trainer.run_code, pargs.chunk_size, pargs.batch_size, pargs.epochs, pargs.embedding_size, pargs.num_heads,
             pargs.dim_feedforward, pargs.num_layers, pargs.lr
