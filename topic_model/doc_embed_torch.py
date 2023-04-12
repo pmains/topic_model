@@ -153,7 +153,7 @@ class PredictChunkDataset(Dataset):
         chunk_df = pd.read_csv(os.path.join("data", f"sequential-chunks-{chunk_size}.csv"))
         chunk_df = chunk_df[chunk_df['is_train'] == is_train]
 
-        for chunk_pair in chunk_df.iterrows:
+        for _, chunk_pair in chunk_df.iterrows():
             video_id = chunk_pair.video_id
             # File names in format "[file name]._[chunk id].pt
             chunk_a_id = chunk_pair.chunk_a
@@ -258,7 +258,7 @@ class DocumentDualEmbedder(nn.Module):
 
         # Layer to predict whether the next chunk is a continuation of the current chunk
         self.next_chunk_classifier = nn.Sequential(
-            nn.Linear(embedding_size*4, 2),
+            nn.Linear(embedding_size*8, 2),
             nn.Softmax(dim=-1),
         )
 
@@ -309,11 +309,11 @@ class DocumentDualEmbedder(nn.Module):
             # Get the average of the encoding vectors weighted by the IDF weights
             mean_embedding = (encoding_vec * idf_weights).sum(dim=0)
             max_embedding = encoding_vec.max(dim=0)[0]
-            # min_embedding = encoding_vec.min(dim=0)[0]
-            # std_embedding = encoding_vec.std(dim=0)
+            min_embedding = encoding_vec.min(dim=0)[0]
+            std_embedding = encoding_vec.std(dim=0)
             # Concatenate the mean, max, min, and std embeddings
-            doc_embedding_vec = torch.cat((mean_embedding, max_embedding)).unsqueeze(0)
-            # doc_embedding_vec = torch.cat((mean_embedding, max_embedding, min_embedding, std_embedding)).unsqueeze(0)
+            # doc_embedding_vec = torch.cat((mean_embedding, max_embedding)).unsqueeze(0)
+            doc_embedding_vec = torch.cat((mean_embedding, max_embedding, min_embedding, std_embedding)).unsqueeze(0)
 
             # Add the document embedding to the doc_embeddings tensor
             if doc_embeddings is None:
