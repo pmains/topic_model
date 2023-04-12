@@ -84,7 +84,7 @@ class DocumentDataset(Dataset):
         """Set folder path and vocab"""
         self.folder_path = folder_path
         # Get a list of all files in the folder
-        self.file_list = os.listdir(self.folder_path)
+        self.file_list = [doc for doc in os.listdir(self.folder_path) if doc.endswith(".pt")]
         # Put the files in random order
         shuffle(self.file_list)
 
@@ -133,8 +133,7 @@ class PredictChunkDataset(Dataset):
         Files in our directory will have a name in format "{channel}-{video_id}_{chunk_id}.pt"
         The chunk_id values are sequential, so we can use them to sort the files
         Files are only considered sequential if they belong to the same channel and video_id
-        So we first group the files by channel and video_id, and then sort them by chunk_id
-        Only a chunk with a subsequent chunk_id can be used to predict the next chunk
+        These pairs are generated during the --chunk preprocessing step and stored in a CSV file.
 
         :param dir_path: Path to the directory containing the dataset
         """
@@ -143,38 +142,31 @@ class PredictChunkDataset(Dataset):
         self.chunk_list = []
         self.mask_prob = mask_prob
 
-        def get_video(file_name):
-            last_underscore = file_name.rfind('_')
-            file_video_id = file_name[:last_underscore]
-            chunk_id = int(file_name[last_underscore + 1:-3])
-
-            return file_video_id, chunk_id
-
         # Get a list of all files in the directory and create a dataframe
         print("Grouping files by channel and video_id ...")
         file_list = os.listdir(self.dir_path)
-        file_df = pd.DataFrame(file_list, columns=['file_name'])
-        file_df[['video_id', 'chunk_id']] = file_df.file_name.apply(lambda x: pd.Series(get_video(x)))
-        # Group the files by channel and video_id
-        grouped = file_df.groupby(['video_id'])
 
-        # Iterate and add each subsequent pair of chunks to the chunk_list
-        print("Iterating over videos to find subsequent chunks ...")
-        for video_id, group in tqdm(grouped):
-            group = group.sort_values('chunk_id')
-            for i in range(len(group) - 1):
-                # Add the input and predict chunk file names to the chunk_list
-                input_chunk_file = group.iloc[i].file_name
-                # Randomly choose the next chunk or a random chunk to predict
-                if random() < 0.5:
-                    # Use the next chunk as the predict chunk
-                    predict_chunk_file = group.iloc[i + 1].file_name
-                    is_next_chunk = True
-                else:
-                    # Use a random chunk as the predict chunk
-                    predict_chunk_file = sample(list(group.file_name), 1)[0]
-                    is_next_chunk = False
-                self.chunk_list.append((input_chunk_file, predict_chunk_file, is_next_chunk))
+        folder, chunk_size = self.dir_path.split("-")
+        data_type = folder.split(os.sep)[-1]
+        is_train = data_type == 'train'
+
+        chunk_df = pd.read_csv(os.path.join("data", f"sequential-chunks-{chunk_size}.csv"))
+        chunk_df = chunk_df[chunk_df['is_train'] == is_train]
+
+        for chunk_pair in chunk_df.iterrows:
+            video_id = chunk_pair.video_id
+            # File names in format "[file name]._[chunk id].pt
+            chunk_a_id = chunk_pair.chunk_a
+            chunk_b_id = chunk_pair.chunk_a
+            chunk_a_file = f"{video_id}_{chunk_a_id:04d}.pt"
+            if random() < .5:
+                chunk_b_file = f"{video_id}_{chunk_b_id:04d}.pt"
+                is_next_chunk = True
+            else:
+                chunk_b_file = sample(file_list, 1)[0]
+                is_next_chunk = False
+
+            self.chunk_list.append((chunk_a_file, chunk_b_file, is_next_chunk))
 
     def __len__(self):
         return len(self.chunk_list)  # Return the total number of samples in the dataset
@@ -235,7 +227,7 @@ class DocumentMLMEmbedder(nn.Module):
                 idf_list = [self.idf_weights[token_id] for token_id in doc]
                 idf_tensor = torch.tensor(idf_list).unsqueeze(1).repeat(1, encoded_doc.shape[1])
                 # Take the mean of the IDF-weighted encoded sequence to get a document-level embedding
-                doc_embedding = (encoded_doc * idf_tensor).mean(dim=1).squeeze(0)
+                doc_embedding = (encoded_doc * idf_tensor).sum(dim=1).squeeze(0)
                 batch_embeddings = add_to_batch(batch_embeddings, doc_embedding)
 
             return batch_embeddings
@@ -315,7 +307,7 @@ class DocumentDualEmbedder(nn.Module):
             # Normalize IDF weights and repeat them to match the shape of the encoding vectors
             idf_weights = (idf_weights / idf_weights.sum()).unsqueeze(1).repeat(1, encoding_vec.shape[1])
             # Get the average of the encoding vectors weighted by the IDF weights
-            mean_embedding = (encoding_vec * idf_weights).mean(dim=0)
+            mean_embedding = (encoding_vec * idf_weights).sum(dim=0)
             max_embedding = encoding_vec.max(dim=0)[0]
             # min_embedding = encoding_vec.min(dim=0)[0]
             # std_embedding = encoding_vec.std(dim=0)
@@ -656,6 +648,7 @@ def chunk_data(chunk_size):
 
     # Pre-compute sequential chunks in each document for the PredictChunkDataset class
     sequential_chunks = {
+        'video_id': [],
         'chunk_a': [],
         'chunk_b': [],
         'is_train': [],
@@ -690,10 +683,15 @@ def chunk_data(chunk_size):
                 embeddings, (0, chunk_size - len(embeddings)), "constant", PAD_TOKEN_ID
             )
 
-            chunk_name = f"{filename}_{chunk_id:04d}"
+            # Get the video id from the filename
+            video_id = filename[:filename.rfind(".")]
+
+            # Save the chunk
+            chunk_name = f"{video_id}_{chunk_id:04d}"
             if chunk_id > 0:
-                sequential_chunks['chunk_a'].append(f"{filename}_{chunk_id - 1:04d}")
-                sequential_chunks['chunk_b'].append(chunk_name)
+                sequential_chunks['video_id'].append(video_id)
+                sequential_chunks['chunk_a'].append(chunk_id - 1)
+                sequential_chunks['chunk_b'].append(chunk_id)
                 sequential_chunks['is_train'].append(chunk_dir == train_dir)
 
             # Save the chunk
