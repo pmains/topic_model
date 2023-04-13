@@ -837,7 +837,7 @@ if __name__ == "__main__":
     # Run modes
     parser.add_argument("--chunk", action="store_true")
     parser.add_argument("--train", action="store_true")
-    parser.add_argument("--reinforce", action="store_true")
+    parser.add_argument("--validate", action="store_true")
 
     # Add argument to choose either MLM or Dual model
     parser.add_argument("--model-type", type=str, default="dual")
@@ -891,3 +891,10 @@ if __name__ == "__main__":
             trainer.run_code, pargs.chunk_size, pargs.batch_size, pargs.epochs, pargs.embedding_size, pargs.num_heads,
             pargs.dim_feedforward, pargs.num_layers, pargs.lr
         )
+
+    if pargs.validate:
+        trainer = DocumentEmbeddingTrainer(run_code=pargs.run_code, model_type=pargs.model_type, is_test=True)
+        trainer.load_model(pargs.run_code)
+
+        r2, f1, accuracy = trainer.validate()
+        print(f"r2: {r2}, f1: {f1}, accuracy: {accuracy}")
