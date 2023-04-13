@@ -343,6 +343,7 @@ class DocumentEmbeddingTrainer:
     def __init__(self, chunk_size=None, embedding_size=None, run_code=None, model_type=None, is_test=False):
         if run_code is None:
             self.run_code = gen_run_code()
+            print(f"{model_type.upper()} model {self.run_code}")
             self.chunk_size = chunk_size
             self.embedding_size = embedding_size
         else:
@@ -429,66 +430,55 @@ class DocumentEmbeddingTrainer:
         # Read the loss from a file if it exists
         new_loss_df = pd.DataFrame(columns=["run_code", "epoch", "loss"])
 
-        # Sample [self.epochs * self.batch_size] random documents from the training dataset
-        sample_indices = sample(range(len(self.predict_dataset)), self.epochs * self.batch_size)
-
         # Train the model
         print("Training the Dual model ...")
-        for epoch in tqdm(range(self.epochs)):
-            total_loss = 0
-            num_batches = 0
+        dataloader = DataLoader(self.predict_dataset, batch_size=self.batch_size, shuffle=True)
 
-            optimizer.zero_grad()
-            # The input tokens for the first chunk of each pair
-            batch_chunks = None
-            # The masked tokens for the first chunk of each pair
-            batch_masked_chunks = None
-            # The target tokens for the second chunk of each pair
-            batch_next_chunks = None
-            # Whether the second chunk is the next chunk in the document
-            batch_is_next_chunk = []
+        total_loss = 0
+        from tqdm import tqdm
 
-            epoch_sample_indices = sample_indices[epoch * self.batch_size:(epoch + 1) * self.batch_size]
-            for idx in epoch_sample_indices:
-                # Apply masking to the token ids
-                input_chunk, masked_chunk, target_chunk, is_next_chunk = self.predict_dataset[idx]
-                batch_chunks = add_to_batch(batch_chunks, input_chunk)
-                batch_masked_chunks = add_to_batch(batch_masked_chunks, masked_chunk)
-                batch_next_chunks = add_to_batch(batch_next_chunks, target_chunk)
-                batch_is_next_chunk.append(is_next_chunk)
+        # Determine the number of epochs to display in the progress bar
+        num_epochs = min(self.epochs, len(dataloader)) if self.epochs is not None else len(dataloader)
 
-            # Convert the batch to tensors
-            batch_chunks = batch_chunks.to(self.device)
-            batch_masked_chunks = batch_masked_chunks.to(self.device)
-            batch_next_chunks = batch_next_chunks.to(self.device)
+        # Wrap the training loop with a tqdm iterator
+        with tqdm(total=num_epochs, desc="Training", unit="epoch") as progress_bar:
+            for batch_count, batch in enumerate(dataloader, 1):
+                # Unpack the batch
+                batch_chunk, batch_mask, batch_next, batch_is_next = batch
 
-            # Convert batch_is_next_chunk to a tensor
-            batch_is_next_chunk = torch.tensor(batch_is_next_chunk, dtype=torch.float32).to(self.device)
+                # Zero the gradients
+                optimizer.zero_grad()
 
-            batch_masked_logits, batch_next_logits = self.model(batch_chunks, batch_masked_chunks, batch_next_chunks)
+                # Forward pass through the model
+                batch_masked_logits, batch_next_matrix = self.model(
+                    batch_chunk.to(self.device),
+                    batch_mask.to(self.device),
+                    batch_next.to(self.device)
+                )
 
-            # Calculate the loss
-            masked_loss = self.calc_loss(batch_masked_logits, batch_chunks, loss_function)
-            predict_loss = loss_function(
-                batch_next_logits[:, 1].unsqueeze(1),  # Use the True prediction logits and reshape
-                batch_is_next_chunk.unsqueeze(1),  # Reshape as a tensor of shape (batch_size, 1)
-            )
-            loss = masked_loss + predict_loss
+                # Calculate the loss
+                masked_loss = self.calc_loss(batch_masked_logits, batch_chunk, loss_function)
+                predict_loss = loss_function(
+                    batch_next_matrix[:, 1],  # Use the True prediction logits and reshape
+                    batch_is_next.float(),  # Reshape as a tensor of shape (batch_size, 1)
+                )
+                loss = masked_loss + predict_loss
 
-            loss.backward()
-            optimizer.step()
+                loss.backward()
+                optimizer.step()
 
-            # Update the total loss and number of batches
-            total_loss += loss.item()
-            num_batches += 1
+                # Use pd.concat to append the new loss data to the existing loss data
+                new_loss_df = pd.concat([
+                    new_loss_df,
+                    pd.DataFrame([[self.run_code, batch_count + 1, loss]], columns=["run_code", "epoch", "loss"])
+                ], ignore_index=True)
 
-            # Calculate the average loss over all batches
-            avg_loss = total_loss / num_batches
+                # Update the progress bar
+                progress_bar.update(1)
 
-            # Use pd.concat to append the new loss data to the existing loss data
-            new_loss_df = pd.concat([
-                new_loss_df, pd.DataFrame([[self.run_code, epoch + 1, avg_loss]], columns=["run_code", "epoch", "loss"])
-            ], ignore_index=True)
+                # Limit the number of epochs
+                if self.epochs is not None and batch_count >= self.epochs:
+                    break
 
         self.save_loss(new_loss_df)
         self.save_model()
@@ -512,40 +502,39 @@ class DocumentEmbeddingTrainer:
 
         # Train the model
         print("Training the MLM model ...")
-        for epoch in tqdm(range(self.epochs)):
-            # Sample [self.mlm_batch_size] random documents from the training dataset
-            sample_indices = sample(range(len(self.doc_dataset)), self.batch_size)
 
-            batch_targets = None
-            batch_masked = None
+        # Load batches of the test dataset
+        dataloader = DataLoader(self.masked_dataset, batch_size=self.batch_size, shuffle=True)
 
-            for idx in sample_indices:
-                optimizer.zero_grad()
+        # Determine the number of epochs to display in the progress bar
+        num_epochs = min(self.epochs, len(dataloader)) if self.epochs != 0 else len(dataloader)
 
-                # Get the token ids for the current document
-                token_ids = self.doc_dataset[idx]
+        # Wrap the training loop with a tqdm iterator
+        with tqdm(total=num_epochs, desc="Training", unit="epoch") as progress_bar:
+            for batch_count, batch in enumerate(dataloader, 1):
+                # Unpack the MaskedTextDataset batch
+                masked_token_ids, target_token_ids = batch
 
-                # Apply masking to the token ids
-                masked_token_ids_tensor, masked_target_ids = self.masked_dataset.mask_tokens(token_ids)
-                batch_masked = add_to_batch(batch_masked, masked_token_ids_tensor)
-                # And convert target IDs to tensors
-                target_ids_tensor = torch.tensor(masked_target_ids)
-                batch_targets = add_to_batch(batch_targets, target_ids_tensor)
+                # Forward pass through the model
+                batch_logits = self.model(masked_token_ids.to(self.device)).to(self.device)
 
-            # Forward pass through the model
-            batch_logits = self.model(batch_masked.to(self.device)).to(self.device)
+                # Calculate the loss
+                batch_logits_flat = batch_logits.view(-1, batch_logits.shape[-1])
+                batch_targets_flat = target_token_ids.view(-1)
+                loss = loss_function(batch_logits_flat, batch_targets_flat)
+                loss.backward()
+                optimizer.step()
 
-            # Calculate the loss
-            batch_logits_flat = batch_logits.view(-1, batch_logits.shape[-1])
-            batch_targets_flat = batch_targets.view(-1)
-            loss = loss_function(batch_logits_flat, batch_targets_flat)
-            loss.backward()
-            optimizer.step()
+                # Use pd.concat to append the new loss data to the existing loss data
+                new_loss_df = pd.concat([new_loss_df, pd.DataFrame(
+                    [[self.run_code, batch_count + 1, loss.item()]], columns=["run_code", "epoch", "loss"]
+                )], ignore_index=True)
 
-            # Use pd.concat to append the new loss data to the existing loss data
-            new_loss_df = pd.concat([new_loss_df, pd.DataFrame(
-                [[self.run_code, epoch + 1, loss.item()]], columns=["run_code", "epoch", "loss"]
-            )], ignore_index=True)
+                # Update the progress bar
+                progress_bar.update(1)
+
+                if self.epochs is not None and batch_count > self.epochs:
+                    break
 
         self.save_loss(new_loss_df)
         self.save_model()
@@ -560,7 +549,7 @@ class DocumentEmbeddingTrainer:
             # Load batches of the test dataset
             dataloader = DataLoader(self.masked_dataset, batch_size=self.batch_size, shuffle=False)
 
-            for batch_count, batch in enumerate(dataloader):
+            for batch_count, batch in enumerate(dataloader, 1):
                 # Unpack the MaskedTextDataset batch
                 masked_token_ids, target_token_ids = batch
 
@@ -583,7 +572,7 @@ class DocumentEmbeddingTrainer:
             next_r2 = next_f1 = next_accuracy = 0
 
             # Load batches of the test dataset
-            data_loader = DataLoader(self.predict_dataset, batch_size=16, shuffle=False)
+            data_loader = DataLoader(self.predict_dataset, batch_size=self.batch_size, shuffle=False)
 
             batch_count = 0
             for batch_chunk, batch_mask, batch_next, batch_is_next in data_loader:
@@ -803,7 +792,7 @@ def record_run(run_code, chunk_size, batch_size, epochs, embedding_size, num_hea
             "num_layers", "lr"
         ])
 
-    # Record the run hyper-parameters for this run
+    # Record the run hyperparameters for this run
     run_df = pd.concat([
         run_df, pd.DataFrame({
             "run_code": [run_code], "chunk_size": [chunk_size], "batch_size": [batch_size],
@@ -821,7 +810,7 @@ def load_run_config(run_code):
     else:
         raise FileNotFoundError("No runs.csv file found.")
 
-    # Get the hyper-parameters for this run
+    # Get the hyperparameters for this run
     run_config = run_df[run_df["run_code"] == run_code].iloc[0]
     return run_config
 
@@ -849,7 +838,7 @@ if __name__ == "__main__":
     train_group = parser.add_argument_group("model training")
     train_group.add_argument("--batch-size", type=int, default=8)
     train_group.add_argument("--dim-feedforward", type=int, default=512)
-    train_group.add_argument("--epochs", type=int, default=100)
+    train_group.add_argument("--epochs", type=int, default=None)
     train_group.add_argument("--embedding-size", type=int, default=128)
     train_group.add_argument("--num-heads", type=int, default=4)
     train_group.add_argument("--num-layers", type=int, default=2)
@@ -896,5 +885,5 @@ if __name__ == "__main__":
         trainer = DocumentEmbeddingTrainer(run_code=pargs.run_code, model_type=pargs.model_type, is_test=True)
         trainer.load_model(pargs.run_code)
 
-        r2, f1, accuracy = trainer.validate()
-        print(f"r2: {r2}, f1: {f1}, accuracy: {accuracy}")
+        my_r2, my_f1, my_accuracy = trainer.validate()
+        print(f"r2: {my_r2}, f1: {my_f1}, accuracy: {my_accuracy}")
