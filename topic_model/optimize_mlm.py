@@ -28,9 +28,9 @@ def objective(lr, chunk_size, num_layers, batch_size, embedding_size, num_heads,
     batch_size = [1, 2, 4, 8, 16, 32, 64][batch_size]  # batch_size is 1, 2, 4, 8, 16, 32 or 64
 
     # Create a new instance of the trainer with the specified hyper-parameters
-    trainer = DocumentEmbeddingTrainer(chunk_size=chunk_size, embedding_size=embedding_size)
+    trainer = DocumentEmbeddingTrainer(chunk_size=chunk_size, embedding_size=embedding_size, model_type="dual")
     epochs = 100
-    trainer.init_dual(
+    trainer.init_model(
         batch_size=batch_size,
         num_epochs=epochs,
         num_heads=num_heads,
