@@ -22,7 +22,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from nltk.tokenize import word_tokenize
-from torch.utils.data import Dataset
+from sklearn.metrics import r2_score, f1_score, accuracy_score
+from torch.utils.data import Dataset, DataLoader
 from torchtext import vocab
 from tqdm import tqdm
 
@@ -131,7 +132,7 @@ class PredictChunkDataset(Dataset):
     def __init__(self, dir_path, mask_prob=0.15):
         """
         Files in our directory will have a name in format "{channel}-{video_id}_{chunk_id}.pt"
-        The chunk_id values are sequential, so we can use them to sort the files
+        The chunk_id values are sequential, so we can use them to sort the files.
         Files are only considered sequential if they belong to the same channel and video_id
         These pairs are generated during the --chunk preprocessing step and stored in a CSV file.
 
@@ -144,7 +145,7 @@ class PredictChunkDataset(Dataset):
 
         # Get a list of all files in the directory and create a dataframe
         print("Grouping files by channel and video_id ...")
-        file_list = os.listdir(self.dir_path)
+        file_list = [file_name for file_name in os.listdir(self.dir_path) if file_name.endswith(".pt")]
 
         folder, chunk_size = self.dir_path.split("-")
         data_type = folder.split(os.sep)[-1]
@@ -339,7 +340,7 @@ class Int8MinMaxObserver(torch.quantization.MinMaxObserver):
 class DocumentEmbeddingTrainer:
     """This class handles training and evaluation of the document embedding model"""
 
-    def __init__(self, chunk_size=None, embedding_size=None, run_code=None, model_type=None):
+    def __init__(self, chunk_size=None, embedding_size=None, run_code=None, model_type=None, is_test=False):
         if run_code is None:
             self.run_code = gen_run_code()
             self.chunk_size = chunk_size
@@ -362,7 +363,11 @@ class DocumentEmbeddingTrainer:
         # Train the DocumentEmbeddingTransformer to generate document embeddings.
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        self.chunk_dir = os.path.join("data", f"train-{self.chunk_size}")
+        if is_test:
+            self.chunk_dir = os.path.join("data", f"test-{self.chunk_size}")
+        else:
+            self.chunk_dir = os.path.join("data", f"train-{self.chunk_size}")
+
         self.doc_dataset = DocumentDataset(self.chunk_dir)
         self.masked_dataset = None
         self.predict_dataset = None
@@ -545,6 +550,90 @@ class DocumentEmbeddingTrainer:
         self.save_loss(new_loss_df)
         self.save_model()
 
+    def validate(self):
+        """Calculate the R2, F1 and Accuracy Score of our Model on the Test Dataset"""
+
+        r2 = f1 = accuracy = 0
+
+        batch_count = 0
+        if self.model_type == "mlm":
+            # Load batches of the test dataset
+            dataloader = DataLoader(self.masked_dataset, batch_size=self.batch_size, shuffle=False)
+
+            for batch_count, batch in enumerate(dataloader):
+                # Get the token ids for the current document
+                token_ids = batch
+
+                # Apply masking to the token ids
+                masked_token_ids_tensor, masked_target_ids = self.masked_dataset.mask_tokens(token_ids)
+                # Forward pass through the model
+                masked_logits = self.model(masked_token_ids_tensor.to(self.device)).to(self.device)
+                # Convert logits to predictions using argmax
+                mask = masked_token_ids_tensor == MASK_TOKEN_ID
+                masked_pred = torch.argmax(masked_logits, dim=2)[mask]
+                masked_target_ids = torch.tensor(masked_target_ids)[mask]
+
+                # Calculate R1, F1 and Accuracy Score
+                r2 += r2_score(masked_target_ids, masked_pred)
+                f1 += f1_score(masked_target_ids, masked_pred)
+                accuracy += accuracy_score(masked_target_ids, masked_pred)
+
+                if batch_count > 10:
+                    break
+        elif self.model_type == "dual":
+            mask_r2 = mask_f1 = mask_accuracy = 0
+            next_r2 = next_f1 = next_accuracy = 0
+
+            # Load batches of the test dataset
+            data_loader = DataLoader(self.predict_dataset, batch_size=16, shuffle=False)
+
+            batch_count = 0
+            for batch_chunk, batch_mask, batch_next, batch_is_next in data_loader:
+                # Forward pass through the model
+                batch_masked_logits, batch_next_matrix = self.model(
+                    batch_chunk.to(self.device),
+                    batch_mask.to(self.device),
+                    batch_next.to(self.device)
+                )
+                # Calculate R1, F1 and Accuracy Score
+                batch_masked_pred = torch.argmax(batch_masked_logits, dim=2)
+                batch_next_pred = batch_next_matrix[:, 1]
+
+                mask = batch_mask == MASK_TOKEN_ID
+                batch_masked_pred = batch_masked_pred[mask]
+                batch_masked_target = batch_chunk[mask]
+
+                mask_r2 += r2_score(batch_masked_target, batch_masked_pred)
+                mask_f1 += f1_score(batch_masked_target, batch_masked_pred, average="weighted")
+                mask_accuracy += accuracy_score(batch_masked_target, batch_masked_pred)
+
+                # Detach the tensors from the graph and convert them to numpy arrays
+                batch_is_next_float = batch_is_next.float().detach().cpu().numpy()
+                batch_next_pred = batch_next_pred.detach().cpu().numpy()
+                next_r2 += r2_score(batch_is_next_float, batch_next_pred)
+                next_f1 += f1_score(batch_is_next_float, batch_next_pred.round(), average="weighted")
+                next_accuracy += accuracy_score(batch_is_next_float, batch_next_pred.round())
+
+                r2 = (mask_r2 + next_r2) / 2
+                f1 = (mask_f1 + next_f1) / 2
+                accuracy = (mask_accuracy + next_accuracy) / 2
+
+                batch_count += 1
+                if batch_count > 10:
+                    break
+        else:
+            raise ValueError("Invalid model type")
+
+        if batch_count == 0:
+            print("No batches found")
+            return 0, 0, 0
+
+        r2 /= batch_count
+        f1 /= batch_count
+        accuracy /= batch_count
+
+        return r2, f1, accuracy
+
     @staticmethod
     def save_loss(new_loss_df):
         """Save the loss data to a file"""
@@ -583,7 +672,7 @@ class DocumentEmbeddingTrainer:
 
         self.model.apply(apply_qconfig)
 
-    def load_model(self, run_code, vocab_size=VOCAB_SIZE):
+    def load_model(self, run_code):
         """Load a trained model"""
 
         # Get configuration
