@@ -576,8 +576,8 @@ class DocumentEmbeddingTrainer:
                 f1 += f1_score(masked_target_ids, masked_pred, average="weighted")
                 accuracy += accuracy_score(masked_target_ids, masked_pred)
 
-                if batch_count > 10:
-                    break
+                if batch_count % 100 == 0:
+                    print(f"Batch {batch_count} of {len(dataloader)}")
         elif self.model_type == "dual":
             mask_r2 = mask_f1 = mask_accuracy = 0
             next_r2 = next_f1 = next_accuracy = 0
@@ -617,8 +617,8 @@ class DocumentEmbeddingTrainer:
                 accuracy = (mask_accuracy + next_accuracy) / 2
 
                 batch_count += 1
-                if batch_count > 10:
-                    break
+                if batch_count % 100 == 0:
+                    print(f"Batch {batch_count} of {len(data_loader)}")
         else:
             raise ValueError("Invalid model type")
 
