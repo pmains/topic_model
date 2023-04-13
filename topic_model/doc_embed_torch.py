@@ -391,7 +391,7 @@ class DocumentEmbeddingTrainer:
                 num_layers=num_layers,
             ).to(self.device)
         else:
-            self.masked_dataset = MaskedTextDataset(self.chunk_dir)
+            self.masked_dataset = MaskedTextDataset(self.doc_dataset)
 
             print("Creating the MLM model ...")
             self.model = DocumentMLMEmbedder(
@@ -561,21 +561,19 @@ class DocumentEmbeddingTrainer:
             dataloader = DataLoader(self.masked_dataset, batch_size=self.batch_size, shuffle=False)
 
             for batch_count, batch in enumerate(dataloader):
-                # Get the token ids for the current document
-                token_ids = batch
+                # Unpack the MaskedTextDataset batch
+                masked_token_ids, target_token_ids = batch
 
-                # Apply masking to the token ids
-                masked_token_ids_tensor, masked_target_ids = self.masked_dataset.mask_tokens(token_ids)
                 # Forward pass through the model
-                masked_logits = self.model(masked_token_ids_tensor.to(self.device)).to(self.device)
+                masked_logits = self.model(masked_token_ids.to(self.device)).to(self.device)
                 # Convert logits to predictions using argmax
-                mask = masked_token_ids_tensor == MASK_TOKEN_ID
+                mask = masked_token_ids == MASK_TOKEN_ID
                 masked_pred = torch.argmax(masked_logits, dim=2)[mask]
-                masked_target_ids = torch.tensor(masked_target_ids)[mask]
+                masked_target_ids = target_token_ids[mask]
 
                 # Calculate R1, F1 and Accuracy Score
                 r2 += r2_score(masked_target_ids, masked_pred)
-                f1 += f1_score(masked_target_ids, masked_pred)
+                f1 += f1_score(masked_target_ids, masked_pred, average="weighted")
                 accuracy += accuracy_score(masked_target_ids, masked_pred)
 
                 if batch_count > 10:
@@ -679,14 +677,14 @@ class DocumentEmbeddingTrainer:
         run_config_df = pd.read_csv("runs.csv")
         run_config = run_config_df[run_config_df["run_code"] == run_code].iloc[0]
 
-        self.embedding_size = run_config.embedding_size
-        self.epochs = run_config.epochs
-        self.batch_size = run_config.batch_size
-        self.lr = run_config.lr
+        self.embedding_size = run_config.embedding_size.item()
+        self.epochs = run_config.epochs.item()
+        self.batch_size = run_config.batch_size.item()
+        self.lr = run_config.lr.item()
 
         self.init_model(
-            batch_size=run_config.batch_size, num_epochs=run_config.epochs, num_heads=run_config.num_heads,
-            dim_feedforward=run_config.dim_feedforward, num_layers=run_config.num_layers, lr=run_config.lr
+            batch_size=self.batch_size, num_epochs=self.epochs, num_heads=run_config.num_heads.item(),
+            dim_feedforward=run_config.dim_feedforward.item(), num_layers=run_config.num_layers.item(), lr=self.lr
         )
 
         print("Preparing the model for quantization ...")
