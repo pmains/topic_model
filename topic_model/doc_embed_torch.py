@@ -25,6 +25,7 @@ import torch.nn as nn
 from memory_profiler import profile
 from nltk.tokenize import word_tokenize
 from sklearn.metrics import r2_score, f1_score, accuracy_score
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import Dataset, DataLoader
 from torchtext import vocab
 from tqdm import tqdm
@@ -301,34 +302,31 @@ class DocumentDualEmbedder(nn.Module):
         self.idf_weights = None
 
     def forward(self, chunk, masked_chunk=None, next_chunk=None, return_doc_embedding=False):
-        """
-        Take document, masked document, and next chunk as input
-        """
-
-        embedded_chunk = self.embedding(chunk)
-        encoded_chunk = self.transformer(embedded_chunk, embedded_chunk)
-        doc_embedding = self.get_doc_embedding(chunk, encoded_chunk)
+        doc_embedding = self.embedding_and_transformer(chunk, return_doc_embedding)
 
         if return_doc_embedding:
             return doc_embedding
 
-        # Predict the masked tokens
-        embedded_masked_chunk = self.embedding(masked_chunk)
-        encoded_masked_chunk = self.transformer(embedded_masked_chunk, embedded_masked_chunk)
-        masked_logits = self.fc(encoded_masked_chunk)
-
-        embedded_next_chunk = self.embedding(next_chunk)
-        encoded_next_chunk = self.transformer(embedded_next_chunk, embedded_next_chunk)
-        next_chunk_embedding = self.get_doc_embedding(next_chunk, encoded_next_chunk)
-        # Predict the next chunk
-        next_chunk_prob = self.next_chunk_prediction(doc_embedding, next_chunk_embedding)
-
-        # Delete unnecessary tensors to save memory
-        del embedded_chunk, encoded_chunk, embedded_masked_chunk, encoded_masked_chunk, embedded_next_chunk, \
-            encoded_next_chunk
-        gc.collect()
+        masked_logits = checkpoint(self.masked_logits, masked_chunk)
+        next_chunk_prob = checkpoint(self.next_chunk_prediction, doc_embedding, next_chunk)
 
         return masked_logits, next_chunk_prob
+
+    def embedding_and_transformer(self, input_chunk, return_doc_embedding):
+        embedded_chunk = self.embedding(input_chunk)
+        encoded_chunk = self.transformer(embedded_chunk, embedded_chunk)
+        doc_embedding = self.get_doc_embedding(input_chunk, encoded_chunk)
+
+        if return_doc_embedding:
+            return doc_embedding
+
+        return encoded_chunk
+
+    def masked_logits(self, masked_chunk):
+        encoded_masked_chunk = self.embedding_and_transformer(masked_chunk, return_doc_embedding=False)
+        logits = self.fc(encoded_masked_chunk)
+
+        return logits
 
     def next_chunk_prediction(self, doc_embedding, next_chunk_embedding):
         concatenated_embeddings = torch.cat((doc_embedding, next_chunk_embedding), dim=1)
@@ -461,7 +459,6 @@ class DocumentEmbeddingTrainer:
         gc.collect()
         return loss
 
-    @profile
     def train_dual(self):
         """Train the DocumentDualEmbedder model"""
 
@@ -488,7 +485,7 @@ class DocumentEmbeddingTrainer:
         num_epochs = min(self.epochs, len(dataloader)) if self.epochs is not None else len(dataloader)
 
         # Wrap the training loop with a tqdm iterator
-        with torch.autograd.profiler.profile(use_cuda=True) as prof:
+        with torch.autograd.profiler.profile(use_cuda=False) as prof:
             with tqdm(total=num_epochs, desc="Training", unit="epoch") as progress_bar:
                 for batch_count, batch in enumerate(dataloader, 1):
                     # Unpack the batch
@@ -534,7 +531,7 @@ class DocumentEmbeddingTrainer:
                         break
 
         with open("prof.txt", "w") as f:
-            f.write(prof.key_averages().table(sort_by="cuda_memory_usage"))
+            f.write(prof.key_averages().table(sort_by="cpu_time_total"))
 
         self.save_loss(new_loss_df)
         self.save_model()
