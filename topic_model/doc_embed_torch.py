@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import gc
 import os
 import string
 from random import random, shuffle, choice, sample
@@ -386,8 +387,6 @@ class DocumentEmbeddingTrainer:
             self.embedding_size = run_config.embedding_size
 
         self.model = None
-        self.adversary = None
-        self.eps = None
 
         # Hyper-parameters
         self.lr = None
@@ -510,6 +509,9 @@ class DocumentEmbeddingTrainer:
                 progress_bar.update(1)
                 # Empty the GPU cache
                 torch.cuda.empty_cache()
+                # Delete the batch to free up memory
+                del batch
+                gc.collect()
 
                 # Limit the number of epochs
                 if self.epochs is not None and batch_count >= self.epochs:
