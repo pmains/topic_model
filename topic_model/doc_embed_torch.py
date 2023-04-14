@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from memory_profiler import profile
 from nltk.tokenize import word_tokenize
 from sklearn.metrics import r2_score, f1_score, accuracy_score
 from torch.utils.data import Dataset, DataLoader
@@ -460,6 +461,7 @@ class DocumentEmbeddingTrainer:
         gc.collect()
         return loss
 
+    @profile
     def train_dual(self):
         """Train the DocumentDualEmbedder model"""
 
