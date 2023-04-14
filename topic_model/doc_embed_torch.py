@@ -488,49 +488,53 @@ class DocumentEmbeddingTrainer:
         num_epochs = min(self.epochs, len(dataloader)) if self.epochs is not None else len(dataloader)
 
         # Wrap the training loop with a tqdm iterator
-        with tqdm(total=num_epochs, desc="Training", unit="epoch") as progress_bar:
-            for batch_count, batch in enumerate(dataloader, 1):
-                # Unpack the batch
-                batch_chunk, batch_mask, batch_next, batch_is_next = batch
+        with torch.autograd.profiler.profile(use_cuda=True) as prof:
+            with tqdm(total=num_epochs, desc="Training", unit="epoch") as progress_bar:
+                for batch_count, batch in enumerate(dataloader, 1):
+                    # Unpack the batch
+                    batch_chunk, batch_mask, batch_next, batch_is_next = batch
 
-                # Zero the gradients
-                optimizer.zero_grad()
+                    # Zero the gradients
+                    optimizer.zero_grad()
 
-                # Forward pass through the model
-                batch_masked_logits, batch_next_matrix = self.model(
-                    batch_chunk.to(self.device),
-                    batch_mask.to(self.device),
-                    batch_next.to(self.device)
-                )
+                    # Forward pass through the model
+                    batch_masked_logits, batch_next_matrix = self.model(
+                        batch_chunk.to(self.device),
+                        batch_mask.to(self.device),
+                        batch_next.to(self.device)
+                    )
 
-                # Calculate the loss
-                masked_loss = self.calc_loss(batch_masked_logits, batch_chunk, loss_function)
-                predict_loss = loss_function(
-                    batch_next_matrix[:, 1],  # Use the True prediction logits and reshape
-                    batch_is_next.float(),  # Reshape as a tensor of shape (batch_size, 1)
-                )
-                loss = masked_loss + predict_loss
+                    # Calculate the loss
+                    masked_loss = self.calc_loss(batch_masked_logits, batch_chunk, loss_function)
+                    predict_loss = loss_function(
+                        batch_next_matrix[:, 1],  # Use the True prediction logits and reshape
+                        batch_is_next.float(),  # Reshape as a tensor of shape (batch_size, 1)
+                    )
+                    loss = masked_loss + predict_loss
 
-                loss.backward()
-                optimizer.step()
+                    loss.backward()
+                    optimizer.step()
 
-                # Use pd.concat to append the new loss data to the existing loss data
-                new_loss_df = pd.concat([
-                    new_loss_df,
-                    pd.DataFrame([[self.run_code, batch_count + 1, loss]], columns=["run_code", "epoch", "loss"])
-                ], ignore_index=True)
+                    # Use pd.concat to append the new loss data to the existing loss data
+                    new_loss_df = pd.concat([
+                        new_loss_df,
+                        pd.DataFrame([[self.run_code, batch_count + 1, loss]], columns=["run_code", "epoch", "loss"])
+                    ], ignore_index=True)
 
-                # Update the progress bar
-                progress_bar.update(1)
-                # Empty the GPU cache
-                torch.cuda.empty_cache()
-                # Delete tensors to free up memory
-                del batch, batch_chunk, batch_mask, batch_next, batch_is_next, batch_masked_logits, batch_next_matrix
-                gc.collect()
+                    # Update the progress bar
+                    progress_bar.update(1)
+                    # Empty the GPU cache
+                    torch.cuda.empty_cache()
+                    # Delete tensors to free up memory
+                    del batch, batch_chunk, batch_mask, batch_next, batch_is_next, batch_masked_logits, batch_next_matrix
+                    gc.collect()
 
-                # Limit the number of epochs
-                if self.epochs is not None and batch_count >= self.epochs:
-                    break
+                    # Limit the number of epochs
+                    if self.epochs is not None and batch_count >= self.epochs:
+                        break
+
+        with open("prof.txt", "w") as f:
+            f.write(prof.key_averages().table(sort_by="cuda_memory_usage"))
 
         self.save_loss(new_loss_df)
         self.save_model()
