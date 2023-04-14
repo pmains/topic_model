@@ -22,7 +22,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from memory_profiler import profile
 from nltk.tokenize import word_tokenize
 from sklearn.metrics import r2_score, f1_score, accuracy_score
 from torch.utils.data import Dataset, DataLoader
@@ -323,11 +322,21 @@ class DocumentDualEmbedder(nn.Module):
         # Predict the next chunk
         next_chunk_prob = self.next_chunk_prediction(doc_embedding, next_chunk_embedding)
 
+        # Delete unnecessary tensors to save memory
+        del embedded_chunk, encoded_chunk, embedded_masked_chunk, encoded_masked_chunk, embedded_next_chunk, \
+            encoded_next_chunk
+        gc.collect()
+
         return masked_logits, next_chunk_prob
 
     def next_chunk_prediction(self, doc_embedding, next_chunk_embedding):
         concatenated_embeddings = torch.cat((doc_embedding, next_chunk_embedding), dim=1)
         next_chunk_prob = self.next_chunk_classifier(concatenated_embeddings)
+
+        # Delete unnecessary tensors to save memory
+        del concatenated_embeddings
+        gc.collect()
+
         return next_chunk_prob
 
     def get_doc_embedding(self, x, encoding):
@@ -356,6 +365,10 @@ class DocumentDualEmbedder(nn.Module):
                 doc_embeddings = doc_embedding_vec
             else:
                 doc_embeddings = torch.cat((doc_embeddings, doc_embedding_vec))
+
+        # Delete unnecessary tensors to save memory
+        del idf_weights, mean_embedding, max_embedding, min_embedding, std_embedding, doc_embedding_vec
+        gc.collect()
 
         return doc_embeddings.to(encoding.dtype)
 
@@ -447,7 +460,6 @@ class DocumentEmbeddingTrainer:
         gc.collect()
         return loss
 
-    @profile
     def train_dual(self):
         """Train the DocumentDualEmbedder model"""
 
@@ -510,7 +522,7 @@ class DocumentEmbeddingTrainer:
                 progress_bar.update(1)
                 # Empty the GPU cache
                 torch.cuda.empty_cache()
-                # Delete the batch to free up memory
+                # Delete tensors to free up memory
                 del batch, batch_chunk, batch_mask, batch_next, batch_is_next, batch_masked_logits, batch_next_matrix
                 gc.collect()
 
