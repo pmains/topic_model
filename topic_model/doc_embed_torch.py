@@ -195,6 +195,39 @@ class PredictChunkDataset(Dataset):
         return input_chunk, masked_chunk, predict_chunk, is_next_chunk
 
 
+class EmbeddedDocumentDataset(Dataset):
+    """Dataset that return (document, embedding) for a given chunk size and embedder"""
+    def __init__(self, chunk_size, embedder):
+        self.chunk_size = chunk_size
+        self.embedder = embedder
+
+        self.file_list = []
+        train_dir = os.path.join("data", f"train-{chunk_size}")
+        test_dir = os.path.join("data", f"test-{chunk_size}")
+        # Get a list of all token ID files in the directory
+        for dir_path in (train_dir, test_dir):
+            for file_name in os.listdir(dir_path):
+                if file_name.endswith(".pt"):
+                    self.file_list.append(os.path.join(dir_path, file_name))
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        # Get the token ids for the file at the current index
+        token_file_path = self.file_list[idx]
+        # Make sure tensor is of shape (1, chunk_size)
+        token_ids = torch.load(token_file_path).unsqueeze(0)
+        # Get the document embedding for the token ids
+        doc_embedding = self.embedder(token_ids, return_doc_embedding=True)
+        # Get the corresponding text for the token ids
+        text_file_path = token_file_path.replace(".pt", ".txt")
+        with open(text_file_path, "r") as text_file:
+            document = text_file.read()
+
+        return doc_embedding, document
+
+
 class DocumentMLMEmbedder(nn.Module):
     """Embeds documents using a masked language model for training"""
 
@@ -475,6 +508,8 @@ class DocumentEmbeddingTrainer:
 
                 # Update the progress bar
                 progress_bar.update(1)
+                # Empty the GPU cache
+                torch.cuda.empty_cache()
 
                 # Limit the number of epochs
                 if self.epochs is not None and batch_count >= self.epochs:
@@ -532,6 +567,8 @@ class DocumentEmbeddingTrainer:
 
                 # Update the progress bar
                 progress_bar.update(1)
+                # Empty the GPU cache
+                torch.cuda.empty_cache()
 
                 if self.epochs is not None and batch_count > self.epochs:
                     break
@@ -834,7 +871,7 @@ if __name__ == "__main__":
     # Model hyper-parameters
     parser.add_argument("--chunk-size", type=int, default=64)
 
-    # Model training hyper-parameters
+    # Model training hyperparameters
     train_group = parser.add_argument_group("model training")
     train_group.add_argument("--batch-size", type=int, default=8)
     train_group.add_argument("--dim-feedforward", type=int, default=512)
