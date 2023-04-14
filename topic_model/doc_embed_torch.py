@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from memory_profiler import profile
 from nltk.tokenize import word_tokenize
 from sklearn.metrics import r2_score, f1_score, accuracy_score
 from torch.utils.data import Dataset, DataLoader
@@ -442,8 +443,11 @@ class DocumentEmbeddingTrainer:
         logits_view = logits.view(batch_size * seq_len, -1)
         labels_view = targets.view(batch_size * seq_len)
         loss = loss_function(logits_view, labels_view)
+        del logits_view, labels_view
+        gc.collect()
         return loss
 
+    @profile
     def train_dual(self):
         """Train the DocumentDualEmbedder model"""
 
@@ -465,9 +469,6 @@ class DocumentEmbeddingTrainer:
         # Train the model
         print("Training the Dual model ...")
         dataloader = DataLoader(self.predict_dataset, batch_size=self.batch_size, shuffle=True)
-
-        total_loss = 0
-        from tqdm import tqdm
 
         # Determine the number of epochs to display in the progress bar
         num_epochs = min(self.epochs, len(dataloader)) if self.epochs is not None else len(dataloader)
@@ -510,7 +511,7 @@ class DocumentEmbeddingTrainer:
                 # Empty the GPU cache
                 torch.cuda.empty_cache()
                 # Delete the batch to free up memory
-                del batch
+                del batch, batch_chunk, batch_mask, batch_next, batch_is_next, batch_masked_logits, batch_next_matrix
                 gc.collect()
 
                 # Limit the number of epochs
