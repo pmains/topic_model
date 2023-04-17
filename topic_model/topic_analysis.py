@@ -220,7 +220,7 @@ class TopicModeler:
 
         # Get the topic info
         topic_model_df = topic_model.get_topic_info()
-        # Add the topics to the original dataframe
+        # Add the topic to the original dataframe
         topic_df['topic'] = topics
         topic_df['prob'] = probs
         topic_df = topic_df.merge(topic_model_df, left_on='topic', right_on='Topic', how='left')

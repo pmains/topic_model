@@ -753,7 +753,7 @@ def convert_to_quantized(model):
     return model
 
 
-def chunk_data(chunk_size):
+def chunk_data(chunk_size, train_test=True):
     """
     Break each document in data/youtube/raw into 1024 token chunks.
     Divide into train/test sets, and save our respective datasets to the train/test directories.
@@ -761,18 +761,30 @@ def chunk_data(chunk_size):
 
     train_dir = os.path.join("data", f"train-{chunk_size}")
     test_dir = os.path.join("data", f"test-{chunk_size}")
+    topic_dir = os.path.join("data", f"topic-{chunk_size}")
 
-    # Create directories
-    os.makedirs(train_dir, exist_ok=True)
-    os.makedirs(test_dir, exist_ok=True)
+    if train_test:
+        # Set up directories for train/test split and model training
+        os.makedirs(train_dir, exist_ok=True)
+        os.makedirs(test_dir, exist_ok=True)
 
-    # Empty directories
-    print("Emptying train directory ...")
-    for filename in tqdm(os.listdir(train_dir)):
-        os.remove(os.path.join(train_dir, filename))
-    print("Emptying test directory ...")
-    for filename in tqdm(os.listdir(test_dir)):
-        os.remove(os.path.join(test_dir, filename))
+        # Empty directories
+        print("Emptying train directory ...")
+        for filename in tqdm(os.listdir(train_dir)):
+            os.remove(os.path.join(train_dir, filename))
+        print("Emptying test directory ...")
+        for filename in tqdm(os.listdir(test_dir)):
+            os.remove(os.path.join(test_dir, filename))
+
+        src_dir = os.path.join("data", "youtube", "raw")
+    else:
+        # Set up directory for topic modeling
+        os.makedirs(topic_dir, exist_ok=True)
+        print("Emptying topic directory ...")
+        for filename in tqdm(os.listdir(topic_dir)):
+            os.remove(os.path.join(topic_dir, filename))
+
+        src_dir = os.path.join("data", "youtube", "topic")
 
     # Pre-compute sequential chunks in each document for the PredictChunkDataset class
     sequential_chunks = {
@@ -784,10 +796,14 @@ def chunk_data(chunk_size):
 
     # Iterate over each document, with tqdm to show progress
     print("Creating document chunks ...")
-    for filename in tqdm(os.listdir(os.path.join("data", "youtube", "raw"))):
+    for filename in tqdm(os.listdir(src_dir)):
         # Load the document
-        with open(os.path.join("data", "youtube", "raw", filename), "r") as f:
-            doc = f.read()
+        with open(os.path.join(src_dir, filename), "r") as f:
+            try:
+                doc = f.read()
+            except UnicodeDecodeError as ude:
+                print(f"Bad filename: {filename}")
+                raise ude
 
         # Tokenize the document, and get the integer token ids
         tokenized_doc = word_tokenize(doc)
@@ -795,10 +811,13 @@ def chunk_data(chunk_size):
         doc_words = [token for token in tokenized_doc if token in EMBED_VOCAB.stoi]
 
         # Generate random number to determine if this file is in the train or test set
-        if random() < 0.8:
-            chunk_dir = train_dir
+        if train_test:
+            if random() < 0.8:
+                chunk_dir = train_dir
+            else:
+                chunk_dir = test_dir
         else:
-            chunk_dir = test_dir
+            chunk_dir = topic_dir
 
         # Chunk the document into CHUNK_SIZE-1 token chunks
         for i in range(0, len(doc_tokens), chunk_size):
@@ -829,9 +848,11 @@ def chunk_data(chunk_size):
             with open(os.path.join(chunk_dir, f"{chunk_name}.txt"), "w") as f:
                 f.write(" ".join(doc_words[i:i+chunk_size]))
 
-    # Save the sequential chunks
-    sequential_chunks_df = pd.DataFrame(sequential_chunks)
-    sequential_chunks_df.to_csv(os.path.join("data", f"sequential-chunks-{chunk_size}.csv"), index=False)
+    # We only need to save the sequential chunks for model training
+    if train_test:
+        # Save the sequential chunks
+        sequential_chunks_df = pd.DataFrame(sequential_chunks)
+        sequential_chunks_df.to_csv(os.path.join("data", f"sequential-chunks-{chunk_size}.csv"), index=False)
 
 
 def record_run(run_code, chunk_size, batch_size, epochs, embedding_size, num_heads, dim_feedforward, num_layers, lr):
@@ -876,34 +897,38 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     # Run modes
-    parser.add_argument("--chunk", action="store_true")
-    parser.add_argument("--train", action="store_true")
-    parser.add_argument("--validate", action="store_true")
+    parser.add_argument("--chunk", action="store_true", help="Chunk the data into chunks of size --chunk-size")
+    parser.add_argument("--train", action="store_true", help="Train the model")
+    parser.add_argument("--validate", action="store_true", help="Validate the model")
 
     # Add argument to choose either MLM or Dual model
-    parser.add_argument("--model-type", type=str, default="dual")
+    parser.add_argument("--model-type", type=str, default="dual", help="Choose between 'dual' and 'mlm' models")
 
     # Model hyper-parameters
-    parser.add_argument("--chunk-size", type=int, default=64)
+    parser.add_argument("--chunk-size", type=int, default=64, help="Size of chunks to create (e.g. 64, 128 or 256)")
+    parser.add_argument(
+        "--no-train-test", action="store_false", default=True, dest="train_test",
+        help="If provided, topic sets will be created instead of train and test sets."
+    )
 
     # Model training hyperparameters
     train_group = parser.add_argument_group("model training")
-    train_group.add_argument("--batch-size", type=int, default=8)
-    train_group.add_argument("--dim-feedforward", type=int, default=512)
-    train_group.add_argument("--epochs", type=int, default=None)
-    train_group.add_argument("--embedding-size", type=int, default=128)
-    train_group.add_argument("--num-heads", type=int, default=4)
-    train_group.add_argument("--num-layers", type=int, default=2)
-    train_group.add_argument("--lr", type=float, default=1e-4)
+    train_group.add_argument("--batch-size", type=int, default=8, help="Batch size for training or validation")
+    train_group.add_argument("--dim-feedforward", type=int, default=512, help="Feedforward dimension for transformer")
+    train_group.add_argument("--epochs", type=int, default=None, help="Number of epochs to train for")
+    train_group.add_argument("--embedding-size", type=int, default=128, help="Embedding size for transformer")
+    train_group.add_argument("--num-heads", type=int, default=4, help="Number of heads for transformer")
+    train_group.add_argument("--num-layers", type=int, default=2, help="Number of layers for transformer")
+    train_group.add_argument("--lr", type=float, default=1e-4, help="Learning rate for training")
 
     # Run code to load a trained model
-    parser.add_argument("--run-code", type=str, default=None)
+    parser.add_argument("--run-code", type=str, default=None, help="Run code to load a trained model")
     pargs = parser.parse_args()
 
     # Chunk the data
     if pargs.chunk:
         print("Chunking data...")
-        chunk_data(pargs.chunk_size)
+        chunk_data(chunk_size=pargs.chunk_size, train_test=pargs.train_test)
 
     # Train the model
     trainer = None
