@@ -13,3 +13,4 @@ gensim
 tqdm
 numpy
 scikit-optimize
+bertopic
