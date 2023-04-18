@@ -214,6 +214,7 @@ class TopicModeler:
             text_df = text_df[text_df['chunk'].isin(chunk_text_paths)].copy()
 
         # Create a list of text chunks that we will add as a column to our dataframe
+        print("Reading text files ...")
         text_chunks = list()
         for idx, chunk_text_path in enumerate(chunk_text_paths):
             with open(chunk_text_path, 'r') as f:
@@ -222,32 +223,41 @@ class TopicModeler:
 
         # If we have an embedder, get the embeddings for each chunk and make a column of our dataframe
         if self.embedder is not None:
+            print("Embedding documents ..")
             # Iterate over the text chunks in batches of 64
             chunk_embeddings = None
-            for i in range(0, len(chunk_text_paths), 64):
+            batch_size = 16
+            for i in tqdm(range(0, len(chunk_text_paths), batch_size)):
                 # Get the embeddings for the current batch
-                batch_text_paths = chunk_text_paths[i:i + 64]
+                batch_text_paths = chunk_text_paths[i:i + batch_size]
                 # Get the corresponding paths for the token files as a tensor
                 batch_token_paths = [path.replace('.txt', '.pt') for path in batch_text_paths]
                 # Read the embeddings from the files and place them in a tensor
                 batch_tokens = [torch.load(path) for path in batch_token_paths]
-                batch_tokens = torch.stack(batch_tokens)
+                batch_token_tensor = torch.stack(batch_tokens)
 
                 # Get the embeddings for the current batch
-                batch_embeddings = self.embedder(batch_tokens, return_doc_embedding=True)
+                batch_embeddings = self.embedder(batch_token_tensor, return_doc_embedding=True)
+                del batch_tokens, batch_token_tensor
                 if chunk_embeddings is None:
                     chunk_embeddings = batch_embeddings
                 else:
                     chunk_embeddings = torch.cat((chunk_embeddings, batch_embeddings))
+                del batch_embeddings
 
+            # Add the embeddings to the dataframe
+            print("Saving embeddings")
             text_df['embedding'] = chunk_embeddings.detach().numpy().tolist()
+            del chunk_embeddings
 
         # Reset df to only include documents with text
         text_df = text_df[text_df['text'] != '']
         text_df = text_df.dropna(subset=['text'])
 
         # Merge the text_df with topics_df
+        print("Merging our data ...")
         topic_df = topic_df.merge(text_df, on='video_id', how='right')
+        del text_df
 
         # # Create a topic model
 

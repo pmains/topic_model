@@ -264,8 +264,10 @@ class DocumentMLMEmbedder(nn.Module):
                 # Take the mean of the IDF-weighted encoded sequence to get a document-level embedding
                 doc_embedding = (encoded_doc * idf_tensor).sum(dim=1).squeeze(0)
                 batch_embeddings = add_to_batch(batch_embeddings, doc_embedding)
+                del doc_embedding, idf_tensor
 
-            return batch_embeddings
+            # Return the document embeddings
+            return batch_embeddings.detach()
 
         # Predict the masked tokens
         logits = self.fc(encoded)
@@ -522,6 +524,9 @@ class DocumentEmbeddingTrainer:
                 progress_bar.update(1)
                 # Empty the GPU cache
                 torch.cuda.empty_cache()
+                # Detach the batch from the graph
+                batch_chunk.detach(), batch_mask.detach(), batch_next.detach(), batch_is_next.detach()
+                batch_masked_logits.detach(), batch_next_matrix.detach()
                 # Delete tensors to free up memory
                 del batch, batch_chunk, batch_mask, batch_next, batch_is_next, batch_masked_logits, batch_next_matrix
                 gc.collect()
