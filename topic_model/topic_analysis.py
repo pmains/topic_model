@@ -365,5 +365,3 @@ if __name__ == "__main__":
         for my_category in categories:
             print(f"Creating topic model for {my_era} {my_category}...")
             topic_modeler.create_topic_model(era=my_era, era_type=HOUSE, category=my_category, make_viz=True)
-            break
-        break
