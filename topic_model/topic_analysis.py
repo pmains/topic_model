@@ -5,6 +5,7 @@ import pandas as pd
 from bertopic import BERTopic
 from sklearn.feature_extraction import text
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+from tqdm import tqdm
 from umap import UMAP
 
 from torch.utils.data import Dataset
@@ -27,21 +28,17 @@ class ChunkDataset(Dataset):
 
         # Get all .txt file paths in data/train-{chunk_size} and data/test-{chunk_size} directories
         # Scan data/train-{chunk_size} directory
-        train_dir = os.path.join("data", f"train-{chunk_size}")
-        train_files = [os.path.join(train_dir, f) for f in os.listdir(train_dir) if f.endswith(".txt")]
-        # Scan data/test-{chunk_size} directory
-        test_dir = os.path.join("data", f"test-{chunk_size}")
-        test_files = [os.path.join(test_dir, f) for f in os.listdir(test_dir) if f.endswith(".txt")]
-
+        topic_dir = os.path.join("data", f"topic-{chunk_size}")
         # Combine the train and test files
-        self.file_paths = train_files + test_files
+        self.file_paths = [os.path.join(topic_dir, f) for f in os.listdir(topic_dir) if f.endswith(".txt")]
+
         # Map video IDs to file paths
         self.video_id_to_file_path = defaultdict(list)
         for file_path in self.file_paths:
             file_name = os.path.basename(file_path)
             # Video ID is everything before the last underscore
-            channel_video_id = file_name[:file_name.rfind("_")]
-            self.video_id_to_file_path[channel_video_id].append(file_path)
+            video_id = file_name[:file_name.rfind("_")]
+            self.video_id_to_file_path[video_id].append(file_path)
 
     def get_file_paths(self, video_id):
         """
@@ -79,7 +76,6 @@ class TopicModeler:
         """
         :param era_df: DataFrame containing era information
         :param chunk_size: Number of words to include in each chunk
-        :param make_viz: Whether to create a visualization of the topic model
         """
 
         # Create a list of stop words
@@ -94,6 +90,10 @@ class TopicModeler:
         self.chunk_size = chunk_size
         self.doc_path = os.path.join("data", f"train-{chunk_size}")
 
+        # Create our dataset, which will return the text chunks for each video
+        print("Creating dataset...")
+        self.chunk_dataset = ChunkDataset(self.chunk_size)
+
     def create_topic_model(self, era: str, era_type: str, category: str, make_viz: bool = False) -> pd.DataFrame:
         """
         Takes a dataframe and era, era_type, and category and returns a topic model dataframe
@@ -106,6 +106,8 @@ class TopicModeler:
             The era_type (presidential or congressional) to filter the dataframe by
         category : str
             The political party to filter the dataframe by
+        make_viz : bool
+            Whether or not to make a visualization of the topic model
 
         Returns
         -------
@@ -144,30 +146,27 @@ class TopicModeler:
         if len(topic_df) == 0:
             return topic_df
 
-        # Create our dataset, which will return the text chunks for each video
-        print("Creating dataset...")
-        chunk_dataset = ChunkDataset(self.chunk_size)
         # Create a dataframe to hold the text chunks
-        text_df = pd.DataFrame(columns=['channel_video_id', 'chunk', 'text'])
+        text_df = pd.DataFrame(columns=['video_id', 'chunk', 'text'])
         # Remove leading @ symbols from channel IDs
         topic_df['channel_id'] = topic_df['channel_id'].str.replace('@', '')
         # Combine the video ID and channel ID to retrieve chunks for each video from the dataset
-        topic_df['channel_video_id'] = topic_df['channel_id'] + '_' + topic_df['video_id']
+        # topic_df['channel_video_id'] = topic_df['channel_id'] + '_' + topic_df['video_id']
 
         # Get the text chunks for each video
         print("Getting text chunks for each video...")
-        for channel_video_id in topic_df['channel_video_id'].values:
+        for video_id in tqdm(topic_df['video_id'].values):
             # Get the file paths for the video's text chunks
-            chunk_paths = chunk_dataset.get_file_paths(channel_video_id)
+            chunk_paths = self.chunk_dataset.get_file_paths(video_id)
             if len(chunk_paths) == 0:
                 continue
             # Read the text from each chunk and add it to the dataframe
-            print(f"Reading {len(chunk_paths)} chunks for {channel_video_id}...")
+            # print(f"Reading {len(chunk_paths)} chunks for {video_id}...")
             video_text_data = list()
             for chunk_path in chunk_paths:
                 with open(chunk_path, 'r') as f:
                     chunk_text = f.read()
-                video_text_data.append({'channel_video_id': channel_video_id, 'chunk': chunk_path, 'text': chunk_text})
+                video_text_data.append({'video_id': video_id, 'chunk': chunk_path, 'text': chunk_text})
 
             # Append the video's text chunks to our dataframe
             text_df = text_df.append(video_text_data, ignore_index=True)
@@ -177,7 +176,7 @@ class TopicModeler:
         text_df = text_df.dropna(subset=['text'])
 
         # Merge the text_df with topics_df
-        topic_df = topic_df.merge(text_df, on='channel_video_id', how='left')
+        topic_df = topic_df.merge(text_df, on='video_id', how='left')
 
         # # Create a topic model
 
