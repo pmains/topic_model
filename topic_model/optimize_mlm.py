@@ -1,3 +1,5 @@
+"""Optimize the hyperparameters of the MLM model using Bayesian optimization."""
+
 import pandas as pd
 import numpy as np
 from skopt import gp_minimize

@@ -1,15 +1,11 @@
 """
-Usage:
-    Break our documents into chunks, and save them as PyTorch tensors:
-    python doc_embed_torch.py --chunk --chunk_size [chunk_size]
+This script is used to train a document embedding models using MLM training and a mixture of MLM and document
+prediction. The models are trained on chunks of transcripts of YouTube videos. The transcripts are split into
+chunks of 64, 128 or 256 tokens. The model is trained to predict the next token in the sequence. The model is
+also trained to predict the document that the chunk belongs to. The models are optimized using gradient descent
+as implemented using the Adam optimizer.
 
-    Train the model:
-    python doc_embed_torch.py --train [--args]
-
-    Reinforce the model:
-    python doc_embed_torch.py --reinforce [--args]
-
-    --help for more info
+The models are evaluated using the following metrics: R2 score, F1 score and accuracy score.
 """
 
 import argparse

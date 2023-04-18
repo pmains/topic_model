@@ -1,3 +1,9 @@
+"""
+This script creates topic models using the BERTopic library. By default, BERTopic uses BERT to create document
+embeddings. However, we can also use the document embeddings created by a trained instance of
+DocumentMLMEmbedder or DocumentDualEmbedder.
+"""
+
 import argparse
 import os
 from collections import defaultdict
@@ -9,13 +15,13 @@ import pandas as pd
 import torch
 from bertopic import BERTopic
 from sklearn.feature_extraction import text
-from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
 from umap import UMAP
 
 from torch.utils.data import Dataset
 
-from doc_embed_torch import DocumentEmbeddingTrainer, load_run_config, add_to_batch
+from doc_embed_torch import DocumentEmbeddingTrainer, load_run_config
 
 PRESIDENTIAL = 'presidential'
 HOUSE = 'house'
@@ -339,13 +345,18 @@ class TopicModeler:
 
 
 if __name__ == "__main__":
+    """
+    Usage:
+    python topic_analysis.py --chunk-size [64|128|256] --max-files [int] --model-type [dual|mlm] --run-code [run_code]
+    """
+
     # Get max_files from command line
     parser = argparse.ArgumentParser()
-    parser.add_argument("--chunk-size", type=int, default=128)
-    parser.add_argument("--max-files", type=int, default=1000)
-    parser.add_argument("--model-type", type=str, default="dual")
+    parser.add_argument("--chunk-size", type=int, default=128, help="Chunk size for embedding generation")
+    parser.add_argument("--max-files", type=int, default=1000, help="Max number of files to process")
+    parser.add_argument("--model-type", type=str, default="dual", help="Model type to use (dual|mlm)")
     # Load model to generate embeddings
-    parser.add_argument("--run-code", type=str, default=None)
+    parser.add_argument("--run-code", type=str, default=None, help="Run code to load model from")
     parsed_args = parser.parse_args()
 
     # Set era_df using os.path.join

@@ -1,3 +1,19 @@
+"""
+Compare the similarity between topic embeddings in two separate eras/categories, calculated by 6 metrics:
+    1. Weighted mean cosine similarity: The cosine similarity between the weighted mean of the topic embeddings
+    2. Weighted mean cosine similarity, no outliers: The cosine similarity between the weighted mean of the topic
+        embeddings, excluding outliers
+    3. Mean Similarity: The mean cosine similarity between all topic embeddings in group A and B
+    4. Mean Similarity, no outliers: The mean cosine similarity between all topic embeddings, excluding outliers
+    5. Continuity: Looking at the maximum cosine similarity between each topic embedding in group A and all topic
+        embeddings in group B. The continuity is the mean of these maximum similarities.
+    6. Adjusted Continuity: Looking at the maximum cosine similarity between each topic embedding in group A and all
+        topic embeddings in group B. The adjusted continuity is the mean of these maximum similarities, divided by the
+        number of topics in group A.
+
+These metrics are calculated for all combinations of eras and categories, and the results are saved in a csv file.
+"""
+
 import argparse
 import os
 
