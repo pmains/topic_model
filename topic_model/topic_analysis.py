@@ -274,7 +274,7 @@ if __name__ == "__main__":
     my_chunk_size = 128
     house_eras = (
         'JB-H2', 'JB-H1', 'DT-H4', 'JB-H3', 'DT-H3', 'DT-H2', 'DT-H1', 'BO-H8', 'BO-H7', 'BO-H6', 'BO-H5', 'BO-H4',
-        'BO-H3', 'BO-H2', 'BO-H1', 'GB-H3', 'GB-H2', 'GB-H1'
+        'BO-H3', 'BO-H2', 'BO-H1'
     )
 
     categories = (DEMOCRAT, REPUBLICAN)
