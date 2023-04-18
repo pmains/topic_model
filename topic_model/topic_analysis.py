@@ -6,6 +6,7 @@ from random import sample, seed
 
 import numpy as np
 import pandas as pd
+import torch
 from bertopic import BERTopic
 from sklearn.feature_extraction import text
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
@@ -14,6 +15,7 @@ from umap import UMAP
 
 from torch.utils.data import Dataset
 
+from doc_embed_torch import DocumentEmbeddingTrainer, load_run_config, add_to_batch
 
 PRESIDENTIAL = 'presidential'
 HOUSE = 'house'
@@ -34,27 +36,57 @@ class ChunkDataset(Dataset):
         # Scan data/train-{chunk_size} directory
         topic_dir = os.path.join("data", f"topic-{chunk_size}")
         # Combine the train and test files
-        self.file_paths = [os.path.join(topic_dir, f) for f in os.listdir(topic_dir) if f.endswith(".txt")]
+        self.text_files = [os.path.join(topic_dir, f) for f in os.listdir(topic_dir) if f.endswith(".txt")]
+        self.token_files = [f.replace(".txt", ".pt") for f in self.text_files]
 
-        # Map video IDs to file paths
-        self.video_id_to_file_path = defaultdict(list)
-        for file_path in self.file_paths:
+        # Map video IDs to text file paths
+        self.video_id_to_text_files = defaultdict(list)
+        for file_path in self.text_files:
             file_name = os.path.basename(file_path)
             # Video ID is everything before the last underscore
             video_id = file_name[:file_name.rfind("_")]
-            self.video_id_to_file_path[video_id].append(file_path)
+            self.video_id_to_text_files[video_id].append(file_path)
 
-    def get_file_paths(self, video_id):
+        # Map video IDs to token file paths
+        self.video_id_to_token_files = defaultdict(list)
+        for file_path in self.token_files:
+            file_name = os.path.basename(file_path)
+            # Video ID is everything before the last underscore
+            video_id = file_name[:file_name.rfind("_")]
+            self.video_id_to_token_files[video_id].append(file_path)
+
+    def get_text_files(self, video_id):
         """
         Return the text file paths for a given video ID
         :param video_id: str in format {channel_id}_{video_id}
         :return: list of file paths
         """
-        return self.video_id_to_file_path[video_id]
+        return self.video_id_to_text_files[video_id]
+
+    def get_token_files(self, video_id):
+        """
+        Return the token file paths for a given video ID
+        :param video_id: str in format {channel_id}_{video_id}
+        :return: list of file paths
+        """
+        return self.video_id_to_token_files[video_id]
+
+    def document_file_names(self, sample_size=None):
+        """Get document test and token file paths"""
+        if sample_size is None or sample_size >= len(self.text_files):
+            return self.text_files, self.token_files
+
+        # Get a random sample of documents
+        seed(1337)
+        # Get a random sample of documents
+        sample_indices = sample(range(len(self.text_files)), sample_size)
+        sample_text_files = [self.text_files[i] for i in sample_indices]
+        sample_token_files = [self.token_files[i] for i in sample_indices]
+        return sample_text_files, sample_token_files
 
     def __len__(self):
         """Returns the number of chunks in the dataset"""
-        return len(self.file_paths)
+        return len(self.text_files)
 
     def __getitem__(self, *indices):
         """
@@ -66,7 +98,7 @@ class ChunkDataset(Dataset):
 
         for index in indices:
             # Read the text from the file
-            with open(self.file_paths[index], "r") as f:
+            with open(self.text_files[index], "r") as f:
                 chunk_text = f.read()
             items.append(chunk_text)
 
@@ -76,10 +108,11 @@ class ChunkDataset(Dataset):
 
 
 class TopicModeler:
-    def __init__(self, era_df: pd.DataFrame, chunk_size: int, max_files: int = 1000):
+    def __init__(self, era_df, chunk_size, max_files=1000, embedder=None, run_code=None):
         """
         :param era_df: DataFrame containing era information
         :param chunk_size: Number of words to include in each chunk
+        :param embedder: Embedding model to use
         """
 
         # Create a list of stop words
@@ -94,6 +127,8 @@ class TopicModeler:
         self.chunk_size = chunk_size
         self.doc_path = os.path.join("data", f"train-{chunk_size}")
         self.max_files = max_files
+        self.embedder = embedder
+        self.run_code = run_code
 
         # Create our dataset, which will return the text chunks for each video
         print("Creating dataset...")
@@ -112,7 +147,7 @@ class TopicModeler:
         category : str
             The political party to filter the dataframe by
         make_viz : bool
-            Whether or not to make a visualization of the topic model
+            Whether to make a visualization of the topic model
 
         Returns
         -------
@@ -151,8 +186,6 @@ class TopicModeler:
         if len(topic_df) == 0:
             return topic_df
 
-        # Create a dataframe to hold the text chunks
-        text_df = pd.DataFrame(columns=['video_id', 'chunk', 'text'])
         # Remove leading @ symbols from channel IDs
         topic_df['channel_id'] = topic_df['channel_id'].str.replace('@', '')
         # Combine the video ID and channel ID to retrieve chunks for each video from the dataset
@@ -160,28 +193,61 @@ class TopicModeler:
 
         # Get the text chunks for each video
         print("Getting text chunks for each video...")
+        chunk_text_paths = list()
+        video_text_data = list()
         for video_id in tqdm(topic_df['video_id'].values):
             # Get the file paths for the video's text chunks
-            chunk_paths = self.chunk_dataset.get_file_paths(video_id)
-            if len(chunk_paths) == 0:
-                continue
-            # Read the text from each chunk and add it to the dataframe
-            # print(f"Reading {len(chunk_paths)} chunks for {video_id}...")
-            video_text_data = list()
-            for chunk_path in chunk_paths:
-                with open(chunk_path, 'r') as f:
-                    chunk_text = f.read()
-                video_text_data.append({'video_id': video_id, 'chunk': chunk_path, 'text': chunk_text})
+            video_text_paths = self.chunk_dataset.get_text_files(video_id)
+            # Add the video's text chunks to our list of text chunks
+            chunk_text_paths.extend(video_text_paths)
+            # Add the video's text chunks to our dataframe
+            for chunk_text_path in video_text_paths:
+                video_text_data.append({'video_id': video_id, 'chunk': chunk_text_path})
 
-            # Append the video's text chunks to our dataframe
-            text_df = text_df.append(video_text_data, ignore_index=True)
+        text_df = pd.DataFrame(video_text_data)
+
+        # If we have more than max_files, randomly sample the text chunks
+        if self.max_files is not None and len(chunk_text_paths) > self.max_files:
+            # Randomly sample the text chunks
+            chunk_text_paths = sample(chunk_text_paths, self.max_files)
+            # Filter the video text dataframe to only include the sampled chunks
+            text_df = text_df[text_df['chunk'].isin(chunk_text_paths)].copy()
+
+        # Create a list of text chunks that we will add as a column to our dataframe
+        text_chunks = list()
+        for idx, chunk_text_path in enumerate(chunk_text_paths):
+            with open(chunk_text_path, 'r') as f:
+                text_chunks.append(f.read())
+        text_df['text'] = text_chunks
+
+        # If we have an embedder, get the embeddings for each chunk and make a column of our dataframe
+        if self.embedder is not None:
+            # Iterate over the text chunks in batches of 64
+            chunk_embeddings = None
+            for i in range(0, len(chunk_text_paths), 64):
+                # Get the embeddings for the current batch
+                batch_text_paths = chunk_text_paths[i:i + 64]
+                # Get the corresponding paths for the token files as a tensor
+                batch_token_paths = [path.replace('.txt', '.pt') for path in batch_text_paths]
+                # Read the embeddings from the files and place them in a tensor
+                batch_tokens = [torch.load(path) for path in batch_token_paths]
+                batch_tokens = torch.stack(batch_tokens)
+
+                # Get the embeddings for the current batch
+                batch_embeddings = self.embedder(batch_tokens, return_doc_embedding=True)
+                if chunk_embeddings is None:
+                    chunk_embeddings = batch_embeddings
+                else:
+                    chunk_embeddings = torch.cat((chunk_embeddings, batch_embeddings))
+
+            text_df['embedding'] = chunk_embeddings.detach().numpy().tolist()
 
         # Reset df to only include documents with text
         text_df = text_df[text_df['text'] != '']
         text_df = text_df.dropna(subset=['text'])
 
         # Merge the text_df with topics_df
-        topic_df = topic_df.merge(text_df, on='video_id', how='left')
+        topic_df = topic_df.merge(text_df, on='video_id', how='right')
 
         # # Create a topic model
 
@@ -198,13 +264,6 @@ class TopicModeler:
         # I'm not sure why UMAP can't be imported directly, but this works
         umap_model = UMAP(n_neighbors=15, n_components=5, min_dist=0.0, metric='cosine')
 
-        """
-        if len(topic_df) < 600:
-            mts = int(round(len(topic_df) * 0.1, 0))
-        else:
-            mts = 75
-        """
-
         # Initialize the BERTopic model and fit it to the text
         print("Training the BERTopic model...")
         # Get time to run fit_transform
@@ -213,18 +272,14 @@ class TopicModeler:
             vectorizer_model=vectorizer_model, top_n_words=5, nr_topics=9, umap_model=umap_model
         )
 
-        # If there are more than self.max_files documents, sample self.max_files documents
-        if len(topic_df) > self.max_files:
-            # Get self.max_files sample indices from the dataframe
-            seed(42)
-            sample_indices = sample(topic_df.index.tolist(), self.max_files)
-            # Get the documents from the sample indices
-            topic_df = topic_df.loc[sample_indices, :].copy()
-            documents = topic_df.loc[sample_indices, 'text'].astype(str).tolist()
+        documents = topic_df['text'].astype(str).tolist()
+        if self.embedder is not None:
+            # Get the topic embeddings as a 2D numpy array
+            embeddings = np.array(topic_df.embedding.values.tolist())
+            topics, probs = topic_model.fit_transform(documents=documents, embeddings=embeddings)
         else:
-            documents = topic_df['text'].astype(str).tolist()
-
-        topics, probs = topic_model.fit_transform(documents=documents)
+            embeddings = None
+            topics, probs = topic_model.fit_transform(documents=documents)
         print(f"Time to run fit_transform: {time.time() - start_time} seconds")
 
         # Get the topic info
@@ -238,9 +293,18 @@ class TopicModeler:
         os.makedirs(os.path.join("data", "topics"), exist_ok=True)
         # Save topic embeddings
         topic_embeddings = np.array(topic_model.topic_embeddings_)
-        np.save(os.path.join("data", "topics", f"{era}_{category}_topic_embeddings.npy"), topic_embeddings)
-        # Save topic info
-        topic_model_df.to_csv(os.path.join("data", "topics", f"{era}_{category}_topic_info.csv"), index=False)
+        if self.run_code is not None:
+            # Save topic embeddings
+            np.save(os.path.join("data", "topics", f"{era}_{category}_topic_embeddings_{self.run_code}.npy"),
+                    topic_embeddings)
+
+            # Save topic info
+            topic_model_df.to_csv(os.path.join("data", "topics", f"{era}_{category}_topic_info_{self.run_code}.csv"),
+                                  index=False)
+        else:
+            np.save(os.path.join("data", "topics", f"{era}_{category}_topic_embeddings.npy"), topic_embeddings)
+            # Save topic info
+            topic_model_df.to_csv(os.path.join("data", "topics", f"{era}_{category}_topic_info.csv"), index=False)
 
         # Make sure data/viz exists
         os.makedirs(os.path.join("data", "viz"), exist_ok=True)
@@ -248,6 +312,7 @@ class TopicModeler:
         if make_viz:
             doc_fig = topic_model.visualize_documents(
                 topic_df['text'].astype(str).tolist(),
+                embeddings=embeddings,
                 title=f'<b>{era} Era {category} Topics</b>',
                 height=600,
                 width=1000
@@ -266,12 +331,15 @@ class TopicModeler:
 if __name__ == "__main__":
     # Get max_files from command line
     parser = argparse.ArgumentParser()
-    parser.add_argument("--max_files", type=int, default=1000)
+    parser.add_argument("--chunk-size", type=int, default=128)
+    parser.add_argument("--max-files", type=int, default=1000)
+    parser.add_argument("--model-type", type=str, default="dual")
+    # Load model to generate embeddings
+    parser.add_argument("--run-code", type=str, default=None)
     parsed_args = parser.parse_args()
 
     # Set era_df using os.path.join
     video_df = pd.read_csv(os.path.join("data", "combined_data.csv"))
-    my_chunk_size = 128
     house_eras = (
         'JB-H2', 'JB-H1', 'DT-H4', 'JB-H3', 'DT-H3', 'DT-H2', 'DT-H1', 'BO-H8', 'BO-H7', 'BO-H6', 'BO-H5', 'BO-H4',
         'BO-H3', 'BO-H2', 'BO-H1'
@@ -279,8 +347,23 @@ if __name__ == "__main__":
 
     categories = (DEMOCRAT, REPUBLICAN)
 
-    topic_modeler = TopicModeler(video_df, chunk_size=my_chunk_size, max_files=parsed_args.max_files)
-    for era in house_eras:
-        for category in categories:
-            print(f"Creating topic model for {era} {category}...")
-            topic_modeler.create_topic_model(era=era, era_type=HOUSE, category=category, make_viz=True)
+    if parsed_args.run_code is not None:
+        run_config = load_run_config(parsed_args.run_code)
+        embed_trainer = DocumentEmbeddingTrainer(run_code=parsed_args.run_code, model_type=parsed_args.model_type)
+        embed_trainer.load_model(run_code=parsed_args.run_code)
+        my_chunk_size = run_config['chunk_size'].item()
+        my_model = embed_trainer.model
+    else:
+        my_model = None
+        my_chunk_size = parsed_args.chunk_size
+
+    topic_modeler = TopicModeler(
+        video_df, chunk_size=my_chunk_size, max_files=parsed_args.max_files, embedder=my_model,
+        run_code=parsed_args.run_code
+    )
+    for my_era in house_eras:
+        for my_category in categories:
+            print(f"Creating topic model for {my_era} {my_category}...")
+            topic_modeler.create_topic_model(era=my_era, era_type=HOUSE, category=my_category, make_viz=True)
+            break
+        break
