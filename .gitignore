@@ -10,6 +10,7 @@ __pycache__
 topic_model/data/test*
 topic_model/data/train*
 topic_model/data/topic-*
+topic_model/data/sequential*
 *.pem
 topic_model/data/models/*
 */.env
