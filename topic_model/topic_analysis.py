@@ -1,6 +1,10 @@
+import argparse
 import os
 from collections import defaultdict
+import time
+from random import sample, seed
 
+import numpy as np
 import pandas as pd
 from bertopic import BERTopic
 from sklearn.feature_extraction import text
@@ -72,7 +76,7 @@ class ChunkDataset(Dataset):
 
 
 class TopicModeler:
-    def __init__(self, era_df: pd.DataFrame, chunk_size: int):
+    def __init__(self, era_df: pd.DataFrame, chunk_size: int, max_files: int = 1000):
         """
         :param era_df: DataFrame containing era information
         :param chunk_size: Number of words to include in each chunk
@@ -89,6 +93,7 @@ class TopicModeler:
         self.video_df = era_df
         self.chunk_size = chunk_size
         self.doc_path = os.path.join("data", f"train-{chunk_size}")
+        self.max_files = max_files
 
         # Create our dataset, which will return the text chunks for each video
         print("Creating dataset...")
@@ -202,20 +207,25 @@ class TopicModeler:
 
         # Initialize the BERTopic model and fit it to the text
         print("Training the BERTopic model...")
-        try:
-            topic_model = BERTopic(
-                vectorizer_model=vectorizer_model, top_n_words=5, nr_topics=9, umap_model=umap_model,
-                embedding_model="distilbert-base-nli-stsb-mean-tokens",
-            )
-            topics, probs = topic_model.fit_transform(topic_df['text'].astype(str).tolist())
-        except ValueError:
-            # Initialize the CountVectorizer with the extended stop words
-            vectorizer_model = CountVectorizer(stop_words=self.stop_words)
-            topic_model = BERTopic(
-                vectorizer_model=vectorizer_model, top_n_words=5, nr_topics=9, umap_model=umap_model,
-                embedding_model="distilbert-base-nli-stsb-mean-tokens",
-            )
-            topics, probs = topic_model.fit_transform(topic_df['text'].astype(str).tolist())
+        # Get time to run fit_transform
+        start_time = time.time()
+        topic_model = BERTopic(
+            vectorizer_model=vectorizer_model, top_n_words=5, nr_topics=9, umap_model=umap_model
+        )
+
+        # If there are more than self.max_files documents, sample self.max_files documents
+        if len(topic_df) > self.max_files:
+            # Get self.max_files sample indices from the dataframe
+            seed(42)
+            sample_indices = sample(topic_df.index.tolist(), self.max_files)
+            # Get the documents from the sample indices
+            topic_df = topic_df.loc[sample_indices, :].copy()
+            documents = topic_df.loc[sample_indices, 'text'].astype(str).tolist()
+        else:
+            documents = topic_df['text'].astype(str).tolist()
+
+        topics, probs = topic_model.fit_transform(documents=documents)
+        print(f"Time to run fit_transform: {time.time() - start_time} seconds")
 
         # Get the topic info
         topic_model_df = topic_model.get_topic_info()
@@ -223,6 +233,14 @@ class TopicModeler:
         topic_df['topic'] = topics
         topic_df['prob'] = probs
         topic_df = topic_df.merge(topic_model_df, left_on='topic', right_on='Topic', how='left')
+
+        # Make sure data/topics exists
+        os.makedirs(os.path.join("data", "topics"), exist_ok=True)
+        # Save topic embeddings
+        topic_embeddings = np.array(topic_model.topic_embeddings_)
+        np.save(os.path.join("data", "topics", f"{era}_{category}_topic_embeddings.npy"), topic_embeddings)
+        # Save topic info
+        topic_model_df.to_csv(os.path.join("data", "topics", f"{era}_{category}_topic_info.csv"), index=False)
 
         # Make sure data/viz exists
         os.makedirs(os.path.join("data", "viz"), exist_ok=True)
@@ -246,8 +264,23 @@ class TopicModeler:
 
 
 if __name__ == "__main__":
+    # Get max_files from command line
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max_files", type=int, default=1000)
+    parsed_args = parser.parse_args()
+
     # Set era_df using os.path.join
     video_df = pd.read_csv(os.path.join("data", "combined_data.csv"))
     my_chunk_size = 128
-    topic_modeler = TopicModeler(video_df, chunk_size=my_chunk_size)
-    topic_modeler.create_topic_model(era='JB-H1', era_type=HOUSE, category=ALL, make_viz=True)
+    house_eras = (
+        'JB-H2', 'JB-H1', 'DT-H4', 'JB-H3', 'DT-H3', 'DT-H2', 'DT-H1', 'BO-H8', 'BO-H7', 'BO-H6', 'BO-H5', 'BO-H4',
+        'BO-H3', 'BO-H2', 'BO-H1', 'GB-H3', 'GB-H2', 'GB-H1'
+    )
+
+    categories = (DEMOCRAT, REPUBLICAN)
+
+    topic_modeler = TopicModeler(video_df, chunk_size=my_chunk_size, max_files=parsed_args.max_files)
+    for era in house_eras:
+        for category in categories:
+            print(f"Creating topic model for {era} {category}...")
+            topic_modeler.create_topic_model(era=era, era_type=HOUSE, category=category, make_viz=True)
