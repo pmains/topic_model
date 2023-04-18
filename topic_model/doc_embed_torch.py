@@ -520,16 +520,20 @@ class DocumentEmbeddingTrainer:
                     pd.DataFrame([[self.run_code, batch_count + 1, loss]], columns=["run_code", "epoch", "loss"])
                 ], ignore_index=True)
 
+                # Detach the batch from the graph
+                batch_chunk.detach(), batch_mask.detach(), batch_next.detach(), batch_is_next.detach()
+                batch_masked_logits.detach(), batch_next_matrix.detach(), masked_loss.detach(), predict_loss.detach()
+                loss.detach()
+
+                # Delete tensors to free up memory
+                del batch, batch_chunk, batch_mask, batch_next, batch_is_next, batch_masked_logits, batch_next_matrix
+                del masked_loss, predict_loss, loss
+                gc.collect()
+
                 # Update the progress bar
                 progress_bar.update(1)
                 # Empty the GPU cache
                 torch.cuda.empty_cache()
-                # Detach the batch from the graph
-                batch_chunk.detach(), batch_mask.detach(), batch_next.detach(), batch_is_next.detach()
-                batch_masked_logits.detach(), batch_next_matrix.detach()
-                # Delete tensors to free up memory
-                del batch, batch_chunk, batch_mask, batch_next, batch_is_next, batch_masked_logits, batch_next_matrix
-                gc.collect()
 
                 # Limit the number of epochs
                 if self.epochs is not None and batch_count >= self.epochs:
